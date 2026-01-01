@@ -18,8 +18,7 @@ jobs:
     - name: Setup Node.js
       uses: actions/setup-node@v3
       with:
-        node-version: '18.20.0' # نسخه فیکس
-        cache: 'none'           # کش غیرفعال
+        node-version: '18.20.0' # نسخه فیکس شده
 
     - name: Initialize Project and Install Dependencies
       run: |
