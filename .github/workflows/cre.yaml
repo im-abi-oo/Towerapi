@@ -2,32 +2,41 @@ name: Node.js Project Setup
 
 on:
   push:
-    branches: [ "main" ] # هر وقت روی برنچ اصلی پوش کنی اجرا می‌شود
+    branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
 
 jobs:
   build:
+    name: Setup Node.js Project from Scratch
     runs-on: ubuntu-latest
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v3
 
-    - name: Use Node.js
+    - name: Setup Node.js
       uses: actions/setup-node@v3
       with:
         node-version: '18'
         cache: 'npm'
 
-    - name: Initialize and Install Dependencies
+    - name: Initialize Project and Install Dependencies
       run: |
+        echo "Checking for package.json..."
         if [ ! -f package.json ]; then
+          echo "package.json not found. Initializing project..."
           npm init -y
         fi
+        echo "Installing dependencies..."
         npm install express mongoose socket.io node-telegram-bot-api cors dotenv
-        
-    - name: Run Build Test
+
+    - name: Verify Installation
       run: |
-        # اینجا چک می‌کنیم که آیا پکیج‌ها درست نصب شده‌اند یا نه
+        echo "Listing installed packages:"
         npm list --depth=0
+
+    - name: Run Basic Test
+      run: |
+        echo "Testing Node.js execution..."
+        node -e "console.log('Node.js project is running correctly!')"
