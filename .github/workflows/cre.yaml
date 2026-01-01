@@ -1,4 +1,4 @@
-name: Setup Node.js Project
+name: Setup Node.js Project Fully
 
 on:
   push:
@@ -20,11 +20,25 @@ jobs:
         with:
           node-version: '20'
 
-      # 3️⃣ ساخت package.json اگر موجود نیست
-      - name: Initialize package.json if missing
+      # 3️⃣ ساخت فایل‌ها اگر موجود نباشن
+      - name: Initialize project files
         run: |
+          # package.json
           if [ ! -f package.json ]; then
             npm init -y
+          fi
+
+          # index.js
+          if [ ! -f index.js ]; then
+            cat <<EOL > index.js
+console.log('Server file placeholder. Replace with your code.');
+EOL
+          fi
+
+          # public folder
+          if [ ! -d public ]; then
+            mkdir public
+            echo "<h1>My App</h1>" > public/index.html
           fi
 
       # 4️⃣ نصب وابستگی‌ها
@@ -32,11 +46,26 @@ jobs:
         run: |
           npm install express mongoose socket.io node-telegram-bot-api cors dotenv
 
-      # 5️⃣ commit و push فایل‌ها به main با GITHUB_TOKEN
-      - name: Commit and Push package files
+      # 5️⃣ commit تغییرات
+      - name: Commit changes
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          git add package.json package-lock.json
-          git commit -m "Add package.json and dependencies" || echo "No changes to commit"
-          git push "https://${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:main
+          git add package.json package-lock.json index.js public/
+          git commit -m "Initialize Node.js project with dependencies" || echo "No changes to commit"
+
+      # 6️⃣ push به branch فرعی
+      - name: Push to feature branch
+        run: |
+          git push "https://${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:setup-node
+
+      # 7️⃣ اتوماتیک Pull Request بساز
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "Initialize Node.js project with dependencies"
+          branch: setup-node
+          base: main
+          title: "Setup Node.js Project"
+          body: "Automated setup of Node.js project, dependencies, index.js, and public folder."
