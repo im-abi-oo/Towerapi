@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Server Monitor</title>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        :root { --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --accent: #38bdf8; --green: #22c55e; --red: #ef4444; }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', sans-serif; }
+        body { background: var(--bg); color: var(--text); padding: 20px; min-height: 100vh; display: flex; flex-direction: column; align-items: center; }
+        
+        .header { width: 100%; max-width: 1000px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; border-bottom: 1px solid #334155; padding-bottom: 20px; }
+        .controls { display: flex; gap: 10px; background: var(--card); padding: 15px; border-radius: 12px; width: 100%; max-width: 1000px; margin-bottom: 20px; flex-wrap: wrap; }
+        input { background: #334155; border: none; padding: 10px 15px; color: white; border-radius: 6px; flex: 1; min-width: 150px; outline: none; transition: 0.3s; }
+        input:focus { ring: 2px solid var(--accent); background: #475569; }
+        button { background: var(--accent); color: #0f172a; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; }
+        button:hover { opacity: 0.9; }
+        
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; width: 100%; max-width: 1000px; }
+        .card { background: var(--card); padding: 20px; border-radius: 12px; border-left: 5px solid gray; transition: all 0.3s; position: relative; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
+        .card.online { border-left-color: var(--green); }
+        .card.offline { border-left-color: var(--red); opacity: 0.8; }
+        
+        .card-header { display: flex; justify-content: space-between; margin-bottom: 10px; }
+        .id { font-size: 1.2rem; font-weight: bold; color: white; }
+        .status { font-size: 0.8rem; padding: 4px 10px; border-radius: 20px; background: rgba(255,255,255,0.1); }
+        .online .status { color: var(--green); background: rgba(34, 197, 94, 0.1); }
+        .offline .status { color: var(--red); background: rgba(239, 68, 68, 0.1); }
+        
+        .time { font-size: 0.85rem; color: #94a3b8; display: block; margin-top: 10px; }
+        .del-btn { position: absolute; bottom: 20px; left: 20px; background: transparent; border: 1px solid var(--red); color: var(--red); padding: 5px 10px; font-size: 0.8rem; display: none; }
+        .del-btn:hover { background: var(--red); color: white; }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h2>📡 Live Monitor</h2>
+        <div id="conn-status" style="font-size: 0.9rem; color: var(--green);">● متصل</div>
+    </div>
+
+    <div class="controls">
+        <input type="text" id="addId" placeholder="شناسه دستگاه">
+        <input type="text" id="addName" placeholder="نام دستگاه">
+        <input type="password" id="addKey" placeholder="رمز افزودن">
+        <button onclick="addDevice()">افزودن / پینگ</button>
+    </div>
+    
+    <div class="controls" style="background: rgba(239, 68, 68, 0.05); border: 1px solid rgba(239, 68, 68, 0.2);">
+        <input type="password" id="delKey" placeholder="رمز حذف را وارد کنید تا دکمه‌ها ظاهر شوند" oninput="toggleDeleteButtons()">
+    </div>
+
+    <div id="grid" class="grid"></div>
+
+    <script>
+        const socket = io();
+        const grid = document.getElementById('grid');
+        
+        // دریافت اولیه
+        fetch('/api/devices').then(r => r.json()).then(devices => {
+            grid.innerHTML = '';
+            devices.forEach(renderCard);
+        });
+
+        // سوکت‌ها
+        socket.on('update', renderCard);
+        socket.on('delete', id => document.getElementById(id)?.remove());
+        socket.on('connect', () => document.getElementById('conn-status').style.color = 'var(--green)');
+        socket.on('disconnect', () => document.getElementById('conn-status').style.color = 'gray');
+
+        function renderCard(dev) {
+            let card = document.getElementById(dev.identifier);
+            const time = new Date(dev.lastHeartbeat).toLocaleTimeString('fa-IR');
+            const html = `
+                <div class="card-header">
+                    <span class="id">${dev.identifier}</span>
+                    <span class="status">${dev.status === 'online' ? 'آنلاین' : 'قطع'}</span>
+                </div>
+                <div style="color: #cbd5e1;">${dev.name}</div>
+                <span class="time">🕒 ${time}</span>
+                <button class="del-btn" onclick="deleteDev('${dev.identifier}')">حذف</button>
+            `;
+
+            if (card) {
+                card.className = `card ${dev.status}`;
+                card.innerHTML = html;
+            } else {
+                card = document.createElement('div');
+                card.id = dev.identifier;
+                card.className = `card ${dev.status}`;
+                card.innerHTML = html;
+                grid.prepend(card);
+            }
+            toggleDeleteButtons();
+        }
+
+        function toggleDeleteButtons() {
+            const show = document.getElementById('delKey').value.length > 0;
+            document.querySelectorAll('.del-btn').forEach(btn => btn.style.display = show ? 'block' : 'none');
+        }
+
+        async function addDevice() {
+            const id = document.getElementById('addId').value;
+            const name = document.getElementById('addName').value;
+            const key = document.getElementById('addKey').value;
+            if(!id || !key) return alert('شناسه و رمز الزامی است');
+            
+            const res = await fetch('/api/ping', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-secret': key },
+                body: JSON.stringify({ identifier: id, name })
+            });
+            if(res.ok) { document.getElementById('addId').value = ''; } 
+            else alert('خطا: رمز اشتباه است');
+        }
+
+        async function deleteDev(id) {
+            const key = document.getElementById('delKey').value;
+            if(confirm('حذف شود؟')) {
+                const res = await fetch(`/api/device/${id}`, { method: 'DELETE', headers: { 'x-secret': key } });
+                if(!res.ok) alert('رمز حذف اشتباه است');
+            }
+        }
+    </script>
+</body>
+</html>
