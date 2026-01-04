@@ -1,28 +1,87 @@
-// app.js — single-file, live extraction API with fixed genres extractor
-// Deps: express, axios, cheerio, node-cron (optional), murmurhash3js (optional)
-// Install: npm i express axios cheerio node-cron murmurhash3js
+// app.js — updated (genre pagination, optional API token, input validation, better errors)
+// Deps: express, axios, cheerio, murmurhash3js (optional)
+// Install: npm i express axios cheerio murmurhash3js
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const murmur = require('murmurhash3js'); // optional, used only in examples
+const murmur = require('murmurhash3js'); // optional, left for examples
 const path = require('path');
 
 const SITE_BASE = 'https://manhwa-tower.ir';
 const CDN_SAMPLE_HOST = 'cdn.megaman-server.ir';
 const MAX_PAGE_CHECK = 2000;
+const MAX_GENRE_PAGES = 20; // configurable ceiling for multi-page genre fetch
+
+const API_TOKEN = process.env.API_TOKEN || null; // set this env var to enable token auth
 
 const app = express();
-app.use(express.json());
+// limit JSON body size to avoid huge payload attacks
+app.use(express.json({ limit: '100kb' }));
 
 /* -------------------------
-   Basic HTML fetcher
+   Utilities
+   ------------------------- */
+function logErr(err, ctx = '') {
+  console.error('[ERROR]', ctx, err && (err.stack || err.message || err));
+}
+
+function sanitizeSlug(slug) {
+  if (!slug || typeof slug !== 'string') return null;
+  // allow letters, numbers, hyphen, underscore; collapse multiple disallowed to '-'
+  const m = slug.match(/[A-Za-z0-9\-_]+/g);
+  return m ? m.join('-') : null;
+}
+
+function parsePage(q, fallback = 1, max = 1000) {
+  const p = parseInt(q || String(fallback), 10);
+  if (isNaN(p) || p < 1) return fallback;
+  return Math.min(p, max);
+}
+
+/* -------------------------
+   Optional API token middleware
+   If process.env.API_TOKEN is set, require it. Otherwise allow open access.
+   Clients may send token via:
+     - header 'x-api-token'
+     - query 'api_token'
+     - Authorization: Bearer <token>
+   ------------------------- */
+app.use((req, res, next) => {
+  try {
+    if (!API_TOKEN) return next();
+    const fromHeader = req.header('x-api-token');
+    const fromQuery = req.query.api_token;
+    const auth = req.header('authorization') || '';
+    const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : null;
+    const token = fromHeader || fromQuery || bearer;
+    if (!token || token !== API_TOKEN) {
+      return res.status(401).json({ ok: false, error: 'Unauthorized: invalid or missing API token' });
+    }
+    return next();
+  } catch (e) {
+    logErr(e, 'auth-middleware');
+    return res.status(500).json({ ok: false, error: 'internal' });
+  }
+});
+
+/* -------------------------
+   Basic HTML fetcher (better error info)
    ------------------------- */
 async function fetchHtml(url, timeout = 20000) {
-  const res = await axios.get(url, {
-    headers: { 'User-Agent': 'manga-prototype-bot/1.0 (+https://example)' },
-    timeout
-  });
-  return res.data;
+  try {
+    const res = await axios.get(url, {
+      headers: { 'User-Agent': 'manga-prototype-bot/1.0 (+https://example)' },
+      timeout,
+      maxRedirects: 5,
+      validateStatus: status => status >= 200 && status < 400
+    });
+    return res.data;
+  } catch (e) {
+    // throw with context
+    const err = new Error(`Failed to fetch ${url}: ${e.message}`);
+    err.original = e;
+    throw err;
+  }
 }
 
 /* -------------------------
@@ -43,7 +102,7 @@ async function existsUrl(url, timeout = 8000) {
       const res2 = await axios({
         method: 'get',
         url,
-        headers: { Range: 'bytes=0-32' },
+        headers: { Range: 'bytes=0-32', 'User-Agent': 'manga-prototype-bot/1.0' },
         timeout,
         maxRedirects: 3,
         validateStatus: () => true
@@ -68,7 +127,8 @@ async function extractHomePage(page = 1) {
 
   $('.manhwa-card').each((i, el) => {
     const a = $(el).find('a').first();
-    const link = a.attr('href') ? new URL(a.attr('href'), SITE_BASE).href : null;
+    const href = a.attr('href') || '';
+    const link = href ? new URL(href, SITE_BASE).href : null;
     const title = a.attr('title') || a.text().trim() || $(el).find('.card-title').text().trim();
     let cover = $(el).find('img').attr('src') || $(el).find('.cover img').attr('src') || null;
     if (cover) cover = cover.startsWith('http') ? cover : new URL(cover, SITE_BASE).href;
@@ -78,7 +138,7 @@ async function extractHomePage(page = 1) {
         const parts = new URL(link).pathname.split('/').filter(Boolean);
         const idx = parts.findIndex(s => s.toLowerCase() === 'manhwa');
         slug = (idx >= 0 && parts.length > idx + 1) ? parts[idx + 1] : parts[parts.length - 1];
-      } catch(e){}
+      } catch (e) {}
     }
     if (link && title) items.push({ slug, title, cover, link });
   });
@@ -103,27 +163,26 @@ async function extractHomePage(page = 1) {
   return items;
 }
 
-/** Fixed extractGenres(): returns array of {name, slug, link} */
-async function extractGenres() {
-  const url = `${SITE_BASE}/gener.php`;
-  const html = await fetchHtml(url);
+/** Fixed extractGenres(): returns array of {name, slug, link} for a single page */
+async function extractGenresPage(pageUrl = `${SITE_BASE}/gener.php`) {
+  const html = await fetchHtml(pageUrl);
   const $ = cheerio.load(html);
   const genres = [];
 
-  // Select anchors that are semantically genre links:
-  //  - anchors with class "genre-btn"
-  //  - or any anchor with query param "slug=" in href
-  const anchors = $('a.genre-btn, a[href*="slug="]');
+  // anchors semantically genre links:
+  const anchors = $('a.genre-btn, a[href*="slug="], a[href*="gener.php"]');
   anchors.each((i, el) => {
     const href = $(el).attr('href') || '';
     const name = $(el).text().trim();
     if (!href || !name) return;
-
-    // Resolve relative hrefs like "?slug=action" or "gener.php?slug=action"
     try {
-      // base the resolution on the page URL to handle "?slug=..." correctly
-      const resolved = new URL(href, `${SITE_BASE}/gener.php`);
-      const slug = resolved.searchParams.get('slug');
+      const resolved = new URL(href, pageUrl);
+      const slug = resolved.searchParams.get('slug') || (() => {
+        // try to infer from path like gener.php/slug or /gener/slug
+        const p = resolved.pathname.split('/').filter(Boolean);
+        if (p.length) return p[p.length - 1];
+        return null;
+      })();
       const link = resolved.href;
       if (slug) genres.push({ name, slug, link });
     } catch (e) {
@@ -131,15 +190,44 @@ async function extractGenres() {
     }
   });
 
-  // dedupe by slug, keep first occurrence
+  // dedupe by slug
   const map = new Map();
-  for (const g of genres) if (!map.has(g.slug)) map.set(g.slug, g);
+  for (const g of genres) if (g.slug && !map.has(g.slug)) map.set(g.slug, g);
+  return Array.from(map.values());
+}
+
+/** Multi-page genres aggregator */
+async function extractGenres(pages = 1) {
+  // pages - number of pagination pages to fetch on gener.php (1..MAX_GENRE_PAGES)
+  const p = Math.max(1, Math.min(Number(pages) || 1, MAX_GENRE_PAGES));
+  const pageUrls = [];
+  for (let i = 1; i <= p; i++) {
+    // Many sites use gener.php?page=N or gener.php?slug=&page=N — for the generic genre index we try gener.php?page=N
+    const u = `${SITE_BASE}/gener.php${i > 1 ? '?page=' + i : ''}`;
+    pageUrls.push(u);
+  }
+
+  const results = await Promise.allSettled(pageUrls.map(u => extractGenresPage(u)));
+  const merged = [];
+  for (const r of results) {
+    if (r.status === 'fulfilled' && Array.isArray(r.value)) {
+      for (const g of r.value) merged.push(g);
+    } else {
+      // log but continue
+      logErr(r.status === 'rejected' ? r.reason : 'unknown', 'extractGenres (page fetch)');
+    }
+  }
+
+  // Final dedupe by slug, keep first occurrence
+  const map = new Map();
+  for (const g of merged) if (g.slug && !map.has(g.slug)) map.set(g.slug, g);
   return Array.from(map.values());
 }
 
 /** Manga detail extractor */
 async function extractMangaDetail(slug) {
-  const url = `${SITE_BASE}/Manhwa/${slug}/`;
+  const safeSlug = sanitizeSlug(slug) || slug;
+  const url = `${SITE_BASE}/Manhwa/${safeSlug}/`;
   const html = await fetchHtml(url);
   const $ = cheerio.load(html);
 
@@ -176,8 +264,10 @@ async function extractMangaDetail(slug) {
       const match = href.match(/Chapter=(\d+),([^&'"]+)/);
       let chapterNum = null;
       if (match) chapterNum = parseInt(match[1], 10);
-      const absolute = new URL(href, SITE_BASE).href;
-      chapters.push({ chapterNum, title: text || (chapterNum ? `Chapter ${chapterNum}` : `#${i+1}`), link: absolute });
+      try {
+        const absolute = new URL(href, SITE_BASE).href;
+        chapters.push({ chapterNum, title: text || (chapterNum ? `Chapter ${chapterNum}` : `#${i+1}`), link: absolute });
+      } catch (e) {}
     }
   });
 
@@ -189,7 +279,7 @@ async function extractMangaDetail(slug) {
   let cover = $('.cover img, .card-img-top, img').first().attr('src') || null;
   if (cover) cover = cover.startsWith('http') ? cover : new URL(cover, SITE_BASE).href;
 
-  return { slug, title, description, genres, internalId, cover, chapters: list, url };
+  return { slug: safeSlug, title, description, genres, internalId, cover, chapters: list, url };
 }
 
 /* -------------------------
@@ -201,27 +291,35 @@ async function extractReaderPages(readerUrl) {
   const $ = cheerio.load(html);
   const imgs = [];
 
+  // common selectors
   $('img.manhwa-image').each((i, el) => {
-    const src = $(el).attr('src') || $(el).attr('data-src');
+    const src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-lazy-src');
     if (src) imgs.push(src.startsWith('http') ? src : new URL(src, SITE_BASE).href);
   });
 
   if (!imgs.length) {
     $('.mhreader, .mhreader-overlay, .reader, .reader-content').find('img').each((i, el) => {
-      const src = $(el).attr('src') || $(el).attr('data-src');
+      const src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-lazy-src');
       if (src) imgs.push(src.startsWith('http') ? src : new URL(src, SITE_BASE).href);
     });
   }
 
+  // general fallback: any images that look like pages
   if (!imgs.length) {
     $('img').each((i, el) => {
-      const src = $(el).attr('src') || $(el).attr('data-src');
+      const src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-srcset') || $(el).attr('srcset');
       if (src && (src.includes('cdn.') || src.includes('/users/') || src.endsWith('.webp') || src.endsWith('.jpg') || src.endsWith('.png'))) {
-        imgs.push(src.startsWith('http') ? src : new URL(src, SITE_BASE).href);
+        // if srcset present, take first URL
+        let chosen = src;
+        if (src.includes(',')) {
+          chosen = src.split(',')[0].trim().split(' ')[0];
+        }
+        imgs.push(chosen.startsWith('http') ? chosen : new URL(chosen, SITE_BASE).href);
       }
     });
   }
 
+  // if still empty, try to scrape scripts for image arrays
   if (!imgs.length) {
     const scripts = $('script').map((i, s) => $(s).html()).get().join('\n');
     const arrMatch = scripts.match(/\[\"(https?:\/\/[^"]+?\.(?:jpg|png|webp))\"(?:,\s*\"https?:\/\/[^"]+?\.(?:jpg|png|webp)\")+\]/);
@@ -231,7 +329,7 @@ async function extractReaderPages(readerUrl) {
         if (Array.isArray(jsonArr)) imgs.push(...jsonArr);
       } catch (e) {}
     }
-    const urlMatches = [...(scripts.matchAll(/https?:\/\/[^'"\s]+(?:webp|jpg|png)/g))].map(m => m[0]);
+    const urlMatches = [...(scripts.matchAll(/https?:\/\/[^'"\s]+?(?:webp|jpg|png)/g))].map(m => m[0]);
     if (urlMatches.length) imgs.push(...urlMatches);
   }
 
@@ -277,70 +375,103 @@ async function discoverPageCountByHead({ uid, mangaName, chapter }) {
 
 app.get('/api/home', async (req, res) => {
   try {
-    const page = parseInt(req.query.page || '1', 10) || 1;
+    const page = parsePage(req.query.page || '1', 1, 1000);
     const items = await extractHomePage(page);
     return res.json({ ok: true, page, items });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
+    logErr(e, '/api/home');
+    return res.status(500).json({ ok: false, error: e.message || 'internal' });
   }
 });
 
 app.get('/api/genres', async (req, res) => {
   try {
-    const list = await extractGenres();
-    return res.json({ ok: true, genres: list });
+    // optional pages param to aggregate multiple pages of the genre index
+    const pages = Math.max(1, Math.min(parseInt(req.query.pages || '1', 10) || 1, MAX_GENRE_PAGES));
+    const list = await extractGenres(pages);
+    return res.json({ ok: true, pages, genres: list });
   } catch (e) {
+    logErr(e, '/api/genres');
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 app.get('/api/genre/:slug', async (req, res) => {
   try {
-    const slug = req.params.slug;
-    const page = parseInt(req.query.page || '1', 10) || 1;
-    const url = `${SITE_BASE}/gener.php?slug=${encodeURIComponent(slug)}${page > 1 ? '&page=' + page : ''}`;
-    const html = await fetchHtml(url);
-    const $ = cheerio.load(html);
-    const items = [];
-    $('.manhwa-card').each((i, el) => {
-      const a = $(el).find('a').first();
-      const link = a.attr('href') ? new URL(a.attr('href'), SITE_BASE).href : null;
-      const title = a.attr('title') || a.text().trim() || $(el).find('.card-title').text().trim();
-      let cover = $(el).find('img').attr('src') || null;
-      if (cover) cover = cover.startsWith('http') ? cover : new URL(cover, SITE_BASE).href;
-      let slugInfer = null;
-      if (link) {
-        const parts = new URL(link).pathname.split('/').filter(Boolean);
-        const idx = parts.findIndex(s => s.toLowerCase() === 'manhwa');
-        slugInfer = (idx >= 0 && parts.length > idx + 1) ? parts[idx + 1] : parts[parts.length - 1];
-      }
-      if (link && title) items.push({ slug: slugInfer, title, cover, link });
-    });
-    return res.json({ ok: true, genre: slug, page, items });
+    const rawSlug = req.params.slug;
+    const slug = sanitizeSlug(rawSlug) || rawSlug;
+    const page = parsePage(req.query.page || '1', 1, 1000);
+    const pages = Math.max(1, Math.min(parseInt(req.query.pages || String(page), 10) || page, MAX_GENRE_PAGES));
+
+    // if pages>1, fetch pages 1..pages and merge items
+    const pageNumbers = Array.from({ length: pages }, (_, i) => i + (page === 1 ? 1 : page) ); // e.g. if page=2 and pages=3 -> [2,3,4]
+    const fetches = pageNumbers.map(pn => (async () => {
+      const url = `${SITE_BASE}/gener.php?slug=${encodeURIComponent(slug)}${pn > 1 ? '&page=' + pn : ''}`;
+      const html = await fetchHtml(url);
+      const $ = cheerio.load(html);
+      const items = [];
+      $('.manhwa-card').each((i, el) => {
+        const a = $(el).find('a').first();
+        const href = a.attr('href') || '';
+        const link = href ? new URL(href, SITE_BASE).href : null;
+        const title = a.attr('title') || a.text().trim() || $(el).find('.card-title').text().trim();
+        let cover = $(el).find('img').attr('src') || null;
+        if (cover) cover = cover.startsWith('http') ? cover : new URL(cover, SITE_BASE).href;
+        let slugInfer = null;
+        if (link) {
+          const parts = new URL(link).pathname.split('/').filter(Boolean);
+          const idx = parts.findIndex(s => s.toLowerCase() === 'manhwa');
+          slugInfer = (idx >= 0 && parts.length > idx + 1) ? parts[idx + 1] : parts[parts.length - 1];
+        }
+        if (link && title) items.push({ slug: slugInfer, title, cover, link });
+      });
+      return items;
+    })());
+
+    const settled = await Promise.allSettled(fetches);
+    const merged = [];
+    for (const s of settled) {
+      if (s.status === 'fulfilled' && Array.isArray(s.value)) merged.push(...s.value);
+      else logErr(s.status === 'rejected' ? s.reason : 'unknown', '/api/genre/:slug page fetch');
+    }
+
+    // dedupe by link
+    const uniq = {};
+    merged.forEach(it => { if (it.link) uniq[it.link] = it; });
+    const items = Object.values(uniq);
+
+    return res.json({ ok: true, genre: slug, requestedPage: page, pagesFetched: pages, items });
   } catch (e) {
+    logErr(e, '/api/genre/:slug');
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 app.get('/api/manga/:slug', async (req, res) => {
   try {
-    const slug = req.params.slug;
+    const rawSlug = req.params.slug;
+    const slug = sanitizeSlug(rawSlug) || rawSlug;
     const detail = await extractMangaDetail(slug);
     return res.json({ ok: true, manga: detail });
   } catch (e) {
+    logErr(e, '/api/manga/:slug');
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
 app.get('/api/reader/:slug/:chapter', async (req, res) => {
   try {
-    const slug = req.params.slug;
-    const chapter = req.params.chapter;
+    const rawSlug = req.params.slug;
+    const slug = sanitizeSlug(rawSlug) || rawSlug;
+    const chapterParam = String(req.params.chapter || '').trim();
+    const chapterNum = parseInt(chapterParam, 10);
+    if (!chapterParam) return res.status(400).json({ ok: false, error: 'chapter required' });
+
     const manga = await extractMangaDetail(slug);
 
     let chapterLink = null;
     if (manga.chapters && manga.chapters.length) {
-      const found = manga.chapters.find(c => String(c.chapterNum) === String(chapter) || (c.title && c.title.includes(String(chapter))));
+      const found = manga.chapters.find(c => String(c.chapterNum) === String(chapterParam) || (c.title && c.title.includes(String(chapterParam))));
       if (found) chapterLink = found.link;
     }
 
@@ -354,15 +485,15 @@ app.get('/api/reader/:slug/:chapter', async (req, res) => {
     const uid = manga.internalId || null;
     const mangaName = manga.title || slug;
     if (uid) {
-      const pageCount = await discoverPageCountByHead({ uid, mangaName, chapter }).catch(()=>null);
+      const pageCount = await discoverPageCountByHead({ uid, mangaName, chapter: chapterParam }).catch(()=>null);
       if (pageCount && pageCount > 0) {
         const pages = [];
-        for (let i = 1; i <= pageCount; i++) pages.push(buildFallbackPageUrl({ uid, mangaName, chapter, page: i }));
+        for (let i = 1; i <= pageCount; i++) pages.push(buildFallbackPageUrl({ uid, mangaName, chapter: chapterParam, page: i }));
         return res.json({ ok: true, method: 'fallback-discovered', pages, pageCount });
       } else {
         const guessed = [];
         const guessCount = 25;
-        for (let i = 1; i <= guessCount; i++) guessed.push(buildFallbackPageUrl({ uid, mangaName, chapter, page: i }));
+        for (let i = 1; i <= guessCount; i++) guessed.push(buildFallbackPageUrl({ uid, mangaName, chapter: chapterParam, page: i }));
         return res.json({ ok: true, method: 'fallback-guess', pages: guessed, note: 'exact pageCount could not be discovered; returned guessed first pages; consider Playwright if site uses heavy JS.' });
       }
     }
@@ -370,6 +501,7 @@ app.get('/api/reader/:slug/:chapter', async (req, res) => {
     return res.status(422).json({ ok: false, error: 'Could not extract pages. Ensure the manga slug is correct and site does not rely on heavy JS.' });
 
   } catch (e) {
+    logErr(e, '/api/reader/:slug/:chapter');
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
@@ -377,7 +509,7 @@ app.get('/api/reader/:slug/:chapter', async (req, res) => {
 app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 app.get('/', (req, res) => {
-  res.type('html').send(`<html><body style="font-family:Arial"><h3>Manga API (live)</h3><p>Endpoints: /api/home?page=1 • /api/genres • /api/genre/:slug?page=N • /api/manga/:slug • /api/reader/:slug/:chapter</p></body></html>`);
+  res.type('html').send(`<html><body style="font-family:Arial"><h3>Manga API (live)</h3><p>Endpoints: /api/home?page=1 • /api/genres?pages=1 • /api/genre/:slug?page=N&pages=M • /api/manga/:slug • /api/reader/:slug/:chapter</p></body></html>`);
 });
 
 const PORT = process.env.PORT || 3000;
