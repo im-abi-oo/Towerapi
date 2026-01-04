@@ -482,6 +482,7 @@ app.get('/api/home', async (req, res) => {
     const excludePopular = ex === '1' || String(ex).toLowerCase() === 'true' || ex === 'yes';
 
     let items = await extractHomePage(page);
+    const filteredItems = items.slice(10);
     let filteredOut = 0;
 
     if (excludePopular) {
