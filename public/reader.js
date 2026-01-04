@@ -1,197 +1,154 @@
 // public/reader.js
-// Exposes window.ManhwaReader with open({slug,chapter,title,pages,containerId,thumbListId})
 (function(){
-  const state = {
-    pages: [], index: 0, mode: 'scroll', zoom: 1, twoPage:false,
-    containerId: 'readerPages', thumbListId: 'thumbList', preloaded: new Set()
-  };
+  const DEFAULT_CONTAINER = 'readerRoot';
+  let state = { pages: [], idx:0, mode:'scroll', zoom:1, twoPage:false, containerId: DEFAULT_CONTAINER, thumbListId: null };
 
-  // utility
-  function el(tag, cls){ const d = document.createElement(tag); if(cls) d.className = cls; return d; }
+  function el(tag, cls){ const d=document.createElement(tag); if(cls) d.className = cls; return d; }
   function qs(id){ return document.getElementById(id); }
-  function lazyLoadImg(img){
-    if(img.dataset.src){ img.src = img.dataset.src; img.removeAttribute('data-src'); }
+
+  function applyZoomToAll(){
+    const root = qs(state.containerId);
+    if(!root) return;
+    root.querySelectorAll('img').forEach(img => {
+      img.style.transform = `scale(${state.zoom})`;
+      img.style.transformOrigin = 'top center';
+    });
   }
 
-  // render pages (scroll mode)
   function renderScroll(){
-    const c = qs(state.containerId);
-    c.innerHTML = '';
-    for(let i=0;i<state.pages.length;i++){
-      const p = state.pages[i];
+    const root = qs(state.containerId);
+    root.innerHTML = '';
+    state.pages.forEach((p,i)=>{
       const img = el('img');
       img.dataset.idx = i;
-      img.dataset.src = p;
       img.loading = 'lazy';
-      img.style.transition = 'transform .15s';
-      img.style.transform = `scale(${state.zoom})`;
-      img.addEventListener('click', ()=> { state.index = i; highlightThumb(); if(state.mode==='paged') renderPaged(); });
-      c.appendChild(img);
-      // preload first couple
-      if(i<3) { img.src = p; state.preloaded.add(p); }
-    }
-    // lazy init observer
-    const imgs = c.querySelectorAll('img[data-src]');
-    if('IntersectionObserver' in window){
-      const obs = new IntersectionObserver((entries, o)=>{
-        entries.forEach(en => { if(en.isIntersecting){ lazyLoadImg(en.target); o.unobserve(en.target); }});
-      }, {root:c, rootMargin:'200px'});
-      imgs.forEach(i => obs.observe(i));
-    } else imgs.forEach(i => lazyLoadImg(i));
-    renderThumbs();
+      img.src = p;
+      img.style.transition = 'transform .12s';
+      img.style.maxWidth = '100%';
+      img.style.marginBottom = '12px';
+      root.appendChild(img);
+    });
+    applyZoomToAll();
   }
 
-  // paged mode
   function renderPaged(){
-    const c = qs(state.containerId);
-    c.innerHTML = '';
-    const wrapper = el('div','paged-wrap');
-    wrapper.style.display = 'flex'; wrapper.style.justifyContent='center'; wrapper.style.alignItems='center'; wrapper.style.height='100%';
-    const left = el('button'); left.textContent = '◀'; left.className = 'btn'; left.onclick = prevPage;
-    const right = el('button'); right.textContent = '▶'; right.className='btn'; right.onclick = nextPage;
-    const img = el('img'); img.id = 'pagedImage'; img.style.maxWidth = state.twoPage ? 'calc(50% - 6px)' : '100%';
-    img.src = state.pages[state.index] || '';
-    wrapper.appendChild(left); wrapper.appendChild(img); wrapper.appendChild(right);
-    c.appendChild(wrapper);
-    renderThumbs();
+    const root = qs(state.containerId);
+    root.innerHTML = '';
+    const wrap = el('div','paged-wrap');
+    wrap.style.display='flex'; wrap.style.justifyContent='center'; wrap.style.alignItems='center';
+    const left = el('button'); left.textContent='◀'; left.className='btn'; left.onclick=prev;
+    const right = el('button'); right.textContent='▶'; right.className='btn'; right.onclick=next;
+    const img = el('img'); img.id='pagedImage'; img.style.maxWidth = state.twoPage ? '48%' : '100%';
+    img.src = state.pages[state.idx] || '';
+    wrap.appendChild(left); wrap.appendChild(img); wrap.appendChild(right);
+    root.appendChild(wrap);
+    applyZoomToAll();
   }
 
-  function renderThumbs(){
-    const t = qs(state.thumbListId);
-    if(!t) return;
-    t.innerHTML = '';
-    state.pages.forEach((p,i)=>{
-      const d = el('div'); d.style.marginBottom='8px';
-      const img = el('img'); img.src = p; img.style.width = '100%'; img.style.objectFit='cover'; img.style.maxHeight='80px';
-      img.onclick = ()=> { state.index = i; if(state.mode==='paged') renderPaged(); else window.scrollTo({ top: i*320, behavior:'smooth' }); highlightThumb(); };
-      d.appendChild(img);
-      if(i === state.index) d.style.outline = '2px solid rgba(124,92,255,0.25)';
-      t.appendChild(d);
-    });
-  }
+  function next(){ if(state.idx < state.pages.length-1) { state.idx++; if(state.mode==='paged') renderPaged(); saveProgress(); } }
+  function prev(){ if(state.idx>0){ state.idx--; if(state.mode==='paged') renderPaged(); saveProgress(); } }
 
-  function highlightThumb(){
-    const t = qs(state.thumbListId);
-    if(!t) return;
-    Array.from(t.children).forEach((c,i)=> c.style.outline = (i===state.index)? '2px solid rgba(124,92,255,0.25)' : 'none');
-  }
-
-  function prevPage(){ if(state.index>0){ state.index--; renderPaged(); highlightThumb(); } }
-  function nextPage(){ if(state.index < state.pages.length-1){ state.index++; renderPaged(); highlightThumb(); } }
-
-  // controls bindings (zoom, mode, twoPage)
-  function bindControls(){
-    const modeSel = qs('readerMode');
-    const zoomRange = qs('zoomRange');
-    const fitBtn = qs('fitWidth');
-    const twoPageBtn = qs('twoPage');
-    const jumpStart = qs('jumpStart');
-
-    if(modeSel) modeSel.value = state.mode;
-    if(modeSel) modeSel.onchange = (e)=> { state.mode = e.target.value; persistMode(); if(state.mode==='paged') renderPaged(); else renderScroll(); };
-    if(zoomRange) zoomRange.oninput = (e)=> { state.zoom = Number(e.target.value); applyZoom(); };
-    if(fitBtn) fitBtn.onclick = ()=> { applyFitWidth(); };
-    if(twoPageBtn) twoPageBtn.onclick = ()=> { state.twoPage = !state.twoPage; renderPaged(); };
-    if(jumpStart) jumpStart.onclick = ()=> { state.index = 0; if(state.mode==='paged') renderPaged(); else window.scrollTo({ top:0, behavior:'smooth' }); highlightThumb(); };
-  }
-
-  function applyZoom(){
-    if(state.mode==='scroll'){
-      const c = qs(state.containerId);
-      c.querySelectorAll('img').forEach(img => img.style.transform = `scale(${state.zoom})`);
-    } else {
-      const img = qs('pagedImage');
-      if(img) img.style.transform = `scale(${state.zoom})`;
-    }
-  }
-  function applyFitWidth(){
-    if(state.mode==='scroll'){
-      const c = qs(state.containerId);
-      c.querySelectorAll('img').forEach(img => { img.style.width='100%'; img.style.transform = `scale(1)`; });
-    } else {
-      const img = qs('pagedImage'); if(img) { img.style.width='100%'; img.style.transform=`scale(1)`; }
-    }
-  }
-
-  function persistMode(){ localStorage.setItem('manhwa_reader_mode', state.mode); }
-  function loadMode(){ const m = localStorage.getItem('manhwa_reader_mode'); if(m) state.mode = m; }
-
-  // preload neighbors
-  function smartPreload(centerIdx){
-    [centerIdx-1, centerIdx+1].forEach(i => {
-      if(i>=0 && i<state.pages.length){
-        const url = state.pages[i];
-        if(!state.preloaded.has(url)){
-          const im = new Image(); im.src = url; im.onload = ()=> state.preloaded.add(url);
-        }
-      }
-    });
-  }
-
-  // open API
-  async function open(opts){
-    // opts: {slug, chapter, title, pages, containerId, thumbListId}
-    state.containerId = opts.containerId || state.containerId;
-    state.thumbListId = opts.thumbListId || state.thumbListId;
-    state.pages = Array.isArray(opts.pages) ? opts.pages.slice() : [];
-    state.index = 0;
-    loadMode();
-    bindControls();
-
-    // if no pages provided, try to fetch (robust)
-    if(!state.pages.length){
-      try{
-        const q = `/api/reader?slug=${encodeURIComponent(opts.slug)}&chapter=${encodeURIComponent(opts.chapter)}`;
-        const res = await fetch(q).then(r=>r.json());
-        if(res && res.pages && res.pages.length) state.pages = res.pages.slice();
-      }catch(e){}
-    }
-
-    if(!state.pages.length){
-      const container = qs(state.containerId);
-      container.innerHTML = '<div class="center muted">صفحه‌ای برای نمایش وجود ندارد</div>';
-      return;
-    }
-
-    // render
-    if(state.mode==='paged') renderPaged(); else renderScroll();
-    highlightThumb();
-    smartPreload(state.index);
-
-    // keyboard handling
-    window.addEventListener('keydown', onKey);
-    // touch swipe (simple)
-    let startX = null;
-    const cont = qs(state.containerId);
-    if(cont){
-      cont.addEventListener('touchstart', e=> startX = e.touches[0].clientX);
-      cont.addEventListener('touchend', e=>{
-        if(startX === null) return;
-        const dx = e.changedTouches[0].clientX - startX;
-        if(Math.abs(dx) > 60){
-          if(dx < 0) nextPage(); else prevPage();
-        }
-        startX = null;
-      });
-    }
-
-    // save progress periodically
-    setInterval(()=> {
-      localStorage.setItem(`manhwa_progress_${opts.slug}_${opts.chapter}`, JSON.stringify({idx: state.index, ts: Date.now()}));
-    }, 2000);
-  }
-
-  function onKey(e){
-    if(e.key === 'ArrowRight' || e.key === 'PageDown') nextPage();
-    if(e.key === 'ArrowLeft' || e.key === 'PageUp') prevPage();
-    if(e.key === 'Escape') close();
+  function bindKeys(){
+    document.onkeydown = function(e){
+      if(e.key==='ArrowRight' || e.key==='PageDown') next();
+      if(e.key==='ArrowLeft' || e.key==='PageUp') prev();
+      if(e.key==='Escape') close();
+    };
   }
 
   function close(){
-    window.removeEventListener('keydown', onKey);
-    // clear container?
-    const c = qs(state.containerId); if(c) c.innerHTML = '';
-    const t = qs(state.thumbListId); if(t) t.innerHTML = '';
+    const root = qs(state.containerId);
+    if(root) root.innerHTML = '';
+    document.onkeydown = null;
+  }
+
+  function saveProgress(){
+    try{
+      const key = `manhwa_progress_${state.slug}_${state.chapter}`;
+      localStorage.setItem(key, JSON.stringify({ idx: state.idx, ts: Date.now() }));
+    }catch(e){}
+  }
+
+  function loadProgress(){
+    try{
+      const key = `manhwa_progress_${state.slug}_${state.chapter}`;
+      const s = localStorage.getItem(key);
+      if(s) { const p = JSON.parse(s); if(typeof p.idx === 'number') state.idx = p.idx; }
+    }catch(e){}
+  }
+
+  async function open(opts){
+    // opts: {slug, chapter, containerId, thumbListId}
+    state.slug = opts.slug;
+    state.chapter = opts.chapter;
+    state.containerId = opts.containerId || state.containerId;
+    state.thumbListId = opts.thumbListId || state.thumbListId;
+    state.mode = localStorage.getItem('manhwa_reader_mode') || 'scroll';
+    state.zoom = 1; state.twoPage = false;
+    bindKeys();
+
+    const root = qs(state.containerId);
+    if(!root) return;
+
+    // try using provided pages first
+    if(Array.isArray(opts.pages) && opts.pages.length) {
+      state.pages = opts.pages.slice();
+    } else {
+      // fetch from API
+      try{
+        const q = `/api/reader?slug=${encodeURIComponent(state.slug)}&chapter=${encodeURIComponent(state.chapter)}`;
+        const res = await fetch(q).then(r=>r.json());
+        state.pages = (res && res.pages) || [];
+      }catch(e){ state.pages = []; }
+    }
+
+    if(!state.pages.length){
+      root.innerHTML = '<div class="center">صفحه‌ای برای نمایش وجود ندارد یا استخراج نشد.</div>';
+      return;
+    }
+
+    loadProgress();
+
+    if(state.mode==='paged') renderPaged();
+    else renderScroll();
+
+    // simple touch for paged
+    let startX = null;
+    root.addEventListener('touchstart', e=> startX = e.touches[0].clientX);
+    root.addEventListener('touchend', e=>{
+      if(startX === null) return;
+      const dx = e.changedTouches[0].clientX - startX;
+      if(Math.abs(dx) > 60){ if(dx < 0) next(); else prev(); }
+      startX = null;
+    });
+
+    // simple controls injection
+    injectControls();
+  }
+
+  function injectControls(){
+    // add small controls overlay
+    const root = qs(state.containerId);
+    if(!root) return;
+    let overlay = document.getElementById('readerControlsOverlay');
+    if(overlay) overlay.remove();
+    overlay = el('div'); overlay.id = 'readerControlsOverlay';
+    overlay.style.position='fixed'; overlay.style.bottom='12px'; overlay.style.left='50%'; overlay.style.transform='translateX(-50%)'; overlay.style.zIndex=9999;
+    overlay.style.display='flex'; overlay.style.gap='8px';
+    const btnZoomIn = el('button'); btnZoomIn.className='btn'; btnZoomIn.textContent = '+';
+    const btnZoomOut = el('button'); btnZoomOut.className='btn'; btnZoomOut.textContent='-';
+    const btnMode = el('button'); btnMode.className='btn'; btnMode.textContent = state.mode==='scroll' ? 'Paged' : 'Scroll';
+    const btnFit = el('button'); btnFit.className='btn'; btnFit.textContent='Fit';
+    btnZoomIn.onclick = ()=> { state.zoom = Math.min(2, state.zoom + 0.1); applyZoomToAll(); };
+    btnZoomOut.onclick = ()=> { state.zoom = Math.max(0.5, state.zoom - 0.1); applyZoomToAll(); };
+    btnMode.onclick = ()=> { state.mode = state.mode==='scroll' ? 'paged' : 'scroll'; localStorage.setItem('manhwa_reader_mode', state.mode); if(state.mode==='paged') renderPaged(); else renderScroll(); btnMode.textContent = state.mode==='scroll' ? 'Paged' : 'Scroll'; };
+    btnFit.onclick = ()=> { // fit width: images width=100%
+      const root = qs(state.containerId);
+      if(!root) return;
+      root.querySelectorAll('img').forEach(img => { img.style.width='100%'; img.style.transform='scale(1)'; });
+    };
+    overlay.appendChild(btnZoomOut); overlay.appendChild(btnZoomIn); overlay.appendChild(btnFit); overlay.appendChild(btnMode);
+    document.body.appendChild(overlay);
   }
 
   // expose
