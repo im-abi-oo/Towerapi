@@ -477,18 +477,30 @@ function seededShuffle(array, seed) {
 
 app.get('/api/home', async (req, res) => {
   try {
-    const page = parsePage(req.query.page, 1);
+    const page = parsePage(req.query.page || '1', 1);
     const ex = req.query.exclude_popular;
     const excludePopular = ex === '1' || String(ex).toLowerCase() === 'true' || ex === 'yes';
 
+    // --- استخراج آیتم‌ها ---
     let items = await extractHomePage(page);
-    let filteredOut = 0;
 
-    // فقط اگر query page مشخص باشه، ۱۰ تای اول رو حذف کن
+    // --- حذف آیتم‌های تکراری بر اساس لینک ---
+    const seenLinks = new Set();
+    items = items.filter(it => {
+      const key = (it.link || it.title || '').trim();
+      if (!key || seenLinks.has(key)) return false;
+      seenLinks.add(key);
+      return true;
+    });
+
+    // --- slice ۱۰ آیتم اول (اگر page مشخص باشه) ---
     if (req.query.page) {
       items = items.slice(10);
     }
 
+    let filteredOut = 0;
+
+    // --- حذف محبوب‌ها اگر exclude_popular فعال باشه ---
     if (excludePopular) {
       const count = Math.max(1, Math.min(Number(req.query.popular_count) || MAX_POPULAR, MAX_POPULAR));
       const popular = await fetchPopularItems(count);
@@ -500,7 +512,7 @@ app.get('/api/home', async (req, res) => {
 
     return res.json({ ok: true, page, items, excludePopular: !!excludePopular, filteredOut });
   } catch (e) {
-    logErr(e, '/api/home (with exclude_popular)');
+    logErr(e, '/api/home (with exclude_popular & dedupe)');
     return res.status(500).json({ ok: false, error: e.message || 'internal' });
   }
 });
