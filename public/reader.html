@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Reader — Manhwa Vault</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar"><div class="brand">Manhwa Vault — Reader</div></header>
+  <main class="container">
+    <div id="readerRoot" class="reader-root"></div>
+  </main>
+
+  <script src="/reader.js"></script>
+  <script>
+    // auto-open by query params ?slug=...&chapter=...
+    const params = new URLSearchParams(location.search);
+    const slug = params.get('slug');
+    const chapter = params.get('chapter');
+    if(slug && chapter && window.ManhwaReader && window.ManhwaReader.open){
+      window.ManhwaReader.open({ slug, chapter, containerId: 'readerRoot', thumbListId: null });
+    } else {
+      document.getElementById('readerRoot').innerHTML = `<div class="center">برای باز کردن ریدر، از سایت روی یک فصل کلیک کن یا آدرس را به شکل <code>/reader?slug=SLUG&chapter=CH</code> باز کن.</div>`;
+    }
+  </script>
+</body>
+</html>
