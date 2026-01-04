@@ -1,0 +1,34 @@
+:root{
+  --bg:#0b0c0f; --panel:#0f1216; --muted:#98a0b0; --accent:#7c5cff;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:Tahoma,Arial;background:var(--bg);color:#e6eef6}
+.topbar{display:flex;align-items:center;gap:12px;padding:12px 18px;background:rgba(255,255,255,0.01);border-bottom:1px solid rgba(255,255,255,0.03)}
+.brand{font-weight:700;font-size:18px}
+.search{margin-left:auto;display:flex;gap:8px}
+.search input{padding:8px;border-radius:8px;background:var(--panel);border:1px solid rgba(255,255,255,0.02);color:inherit}
+.search button{padding:8px 12px;border-radius:8px;border:none;background:var(--accent);color:#fff;cursor:pointer}
+.nav button{background:transparent;border:none;color:var(--muted);padding:8px;border-radius:8px;cursor:pointer}
+.nav button.active{background:rgba(255,255,255,0.02);color:#fff}
+
+.container{max-width:1200px;margin:18px auto;padding:0 12px}
+.section{margin-bottom:18px}
+.section h3{margin:8px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px}
+.card{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border-radius:10px;overflow:hidden;cursor:pointer;border:1px solid rgba(255,255,255,0.03);transition:transform .12s}
+.card:hover{transform:translateY(-6px)}
+.card img{width:100%;aspect-ratio:2/3;object-fit:cover;background:#000}
+.card .meta{padding:8px}
+.card .title{font-size:13px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card .sub{font-size:12px;color:var(--muted);margin-top:6px}
+
+.manga-head{display:flex;gap:14px;align-items:flex-start}
+.manga-cover{width:180px;height:260px;object-fit:cover;border-radius:10px}
+.manga-info h1{margin:0}
+.tags{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.tag{background:rgba(255,255,255,0.03);padding:6px 10px;border-radius:999px;color:var(--muted);font-size:13px}
+
+.chapters{display:flex;flex-direction:column;gap:8px;margin-top:12px}
+.ch-item{display:flex;justify-content:space-between;align-items:center;background:rgba(255,255,255,0.02);padding:8px;border-radius:8px;cursor:pointer}
+
+.center{display:flex;justify-content:center;align-items:center;padding:24px;color:var(--muted)}
