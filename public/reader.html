@@ -5,24 +5,64 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Reader — Manhwa Vault</title>
   <link rel="stylesheet" href="/styles.css">
+  <style>
+    /* reader-specific tweaks */
+    .reader-root{max-width:1200px;margin:16px auto;padding:12px}
+    .controls-panel{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:center;margin-bottom:12px}
+    .server-box, .slider-box{background:rgba(255,255,255,0.02);padding:10px;border-radius:8px}
+    #imageContainer{display:flex;flex-direction:column;align-items:center;gap:10px}
+    .manhwa-image{transition:width .2s ease; width:75%;}
+    @media (max-width:640px){ .manhwa-image{width:100%} }
+    .nav-actions{display:flex;gap:8px;justify-content:center;margin-top:12px}
+  </style>
 </head>
-<body>
+<body class="bg-gray-900 text-white" dir="rtl">
   <header class="topbar"><div class="brand">Manhwa Vault — Reader</div></header>
-  <main class="container">
-    <div id="readerRoot" class="reader-root"></div>
+  <main class="container reader-root">
+    <div id="meta" class="center muted">برای باز کردن، از صفحهٔ سایت روی فصل کلیک کن یا URL را با پارامترها باز کن.</div>
+
+    <div class="controls-panel" style="display:none" id="controls">
+      <div class="server-box">
+        <label>سرور:</label>
+        <select id="serverSelect"><option value="1">سرور ۱</option><option value="2">سرور ۲</option></select>
+      </div>
+
+      <div class="slider-box">
+        <label>اندازه تصویر: <span id="sizeValue">75</span>%</label>
+        <input id="imageSizeSlider" type="range" min="30" max="100" value="75">
+      </div>
+
+      <div class="slider-box">
+        <label><input id="highQuality" type="checkbox"> کیفیت بالا</label>
+      </div>
+
+      <div>
+        <button id="modeToggle" class="btn">حالت: عمودی</button>
+        <button id="fitBtn" class="btn">Fit</button>
+      </div>
+    </div>
+
+    <div id="imageContainer"></div>
+
+    <div class="nav-actions">
+      <button id="prevBtn" class="btn">قسمت قبلی</button>
+      <button id="backBtn" class="btn">بازگشت</button>
+      <button id="nextBtn" class="btn">قسمت بعدی</button>
+    </div>
   </main>
 
   <script src="/reader.js"></script>
   <script>
-    // auto-open by query params ?slug=...&chapter=...
-    const params = new URLSearchParams(location.search);
-    const slug = params.get('slug');
-    const chapter = params.get('chapter');
-    if(slug && chapter && window.ManhwaReader && window.ManhwaReader.open){
-      window.ManhwaReader.open({ slug, chapter, containerId: 'readerRoot', thumbListId: null });
-    } else {
-      document.getElementById('readerRoot').innerHTML = `<div class="center">برای باز کردن ریدر، از سایت روی یک فصل کلیک کن یا آدرس را به شکل <code>/reader?slug=SLUG&chapter=CH</code> باز کن.</div>`;
-    }
+    // auto-open by query
+    (function(){
+      const params = new URLSearchParams(location.search);
+      const slug = params.get('slug');
+      const chapter = params.get('chapter');
+      if(slug && chapter && window.ManhwaReader && window.ManhwaReader.open){
+        document.getElementById('controls').style.display = 'flex';
+        window.ManhwaReader.open({ slug, chapter, containerId: 'imageContainer', controls: true });
+      }
+    })();
   </script>
 </body>
 </html>
