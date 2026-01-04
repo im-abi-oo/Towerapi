@@ -1,5 +1,7 @@
-// app.js — improved: decimal chapters, genre pagination fix, query-based reader endpoints
+// server.js — stable, no API token, fixed structure, supports decimal chapters and genre pagination
 // Deps: express, axios, cheerio
+// npm i express axios cheerio
+
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
@@ -7,51 +9,38 @@ const cheerio = require('cheerio');
 const SITE_BASE = 'https://manhwa-tower.ir';
 const CDN_SAMPLE_HOST = 'cdn.megaman-server.ir';
 const MAX_PAGE_CHECK = 2000;
-const MAX_GENRE_PAGES = 50; // configurable ceiling
-
-const API_TOKEN = process.env.API_TOKEN || null;
 
 const app = express();
-app.use(express.json({ limit: '100kb' }));
+app.use(express.json({ limit: '200kb' })); // small protection for huge bodies
 
-/* ---------- Utilities ---------- */
+/* -------------------------
+   Utilities
+   ------------------------- */
 function logErr(err, ctx = '') {
-  console.error('[ERR]', ctx, err && (err.stack || err.message || err));
+  console.error('[ERROR]', ctx, err && (err.stack || err.message || err));
 }
 function sanitizeSlug(slug) {
   if (!slug || typeof slug !== 'string') return null;
-  // allow letters, numbers, underscore, hyphen; collapse sequences of other chars
   const m = slug.match(/[A-Za-z0-9\-_]+/g);
   return m ? m.join('-') : null;
 }
-function parsePage(q, fallback = 1, max = 1000) {
+function parsePage(q, fallback = 1) {
   const p = parseInt(q || String(fallback), 10);
   if (isNaN(p) || p < 1) return fallback;
-  return Math.min(p, max);
+  return p;
+}
+function normalizeChapterParam(ch) {
+  if (!ch) return null;
+  return String(ch).replace(/[_\-]/g, '.').trim();
 }
 
-/* ---------- Optional Token Middleware ---------- */
-app.use((req, res, next) => {
-  try {
-    if (!API_TOKEN) return next();
-    const header = req.header('x-api-token') || '';
-    const qtoken = req.query.api_token;
-    const auth = req.header('authorization') || '';
-    const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : null;
-    const token = header || qtoken || bearer;
-    if (!token || token !== API_TOKEN) return res.status(401).json({ ok: false, error: 'Unauthorized: invalid or missing API token' });
-    return next();
-  } catch (e) {
-    logErr(e, 'auth');
-    return res.status(500).json({ ok: false, error: 'internal' });
-  }
-});
-
-/* ---------- HTTP helpers ---------- */
+/* -------------------------
+   Network helpers
+   ------------------------- */
 async function fetchHtml(url, timeout = 20000) {
   try {
     const r = await axios.get(url, {
-      headers: { 'User-Agent': 'manga-proxy/1.0' },
+      headers: { 'User-Agent': 'manga-proxy/1.0 (+https://example)' },
       timeout,
       maxRedirects: 5,
       validateStatus: s => s >= 200 && s < 400
@@ -77,13 +66,15 @@ async function existsUrl(url, timeout = 8000) {
   }
 }
 
-/* ---------- Extractors ---------- */
-
+/* -------------------------
+   Extractors
+   ------------------------- */
 async function extractHomePage(page = 1) {
   const url = page === 1 ? `${SITE_BASE}/page/1` : `${SITE_BASE}/page/${page}`;
   const html = await fetchHtml(url);
   const $ = cheerio.load(html);
   const items = [];
+
   $('.manhwa-card').each((i, el) => {
     const a = $(el).find('a').first();
     const href = a.attr('href') || '';
@@ -101,6 +92,7 @@ async function extractHomePage(page = 1) {
     }
     if (link && title) items.push({ slug, title, cover, link });
   });
+
   if (!items.length) {
     $('a[href*="/Manhwa/"]').each((i, el) => {
       const a = $(el);
@@ -117,10 +109,11 @@ async function extractHomePage(page = 1) {
       }
     });
   }
+
   return items;
 }
 
-/* ---------- Genres: page-by-page extractor ---------- */
+/* Genres: page extractor for a single gener.php page */
 async function extractGenresPage(pageUrl = `${SITE_BASE}/gener.php`) {
   const html = await fetchHtml(pageUrl);
   const $ = cheerio.load(html);
@@ -146,8 +139,9 @@ async function extractGenresPage(pageUrl = `${SITE_BASE}/gener.php`) {
   return Array.from(map.values());
 }
 
+/* aggregate multiple genre pages: we don't impose a hard ceiling here — caller decides pages param */
 async function extractGenres(totalPages = 1) {
-  const p = Math.max(1, Math.min(Number(totalPages) || 1, MAX_GENRE_PAGES));
+  const p = Math.max(1, Number(totalPages) || 1);
   const urls = [];
   for (let i = 1; i <= p; i++) {
     urls.push(`${SITE_BASE}/gener.php${i > 1 ? '?page=' + i : ''}`);
@@ -163,7 +157,7 @@ async function extractGenres(totalPages = 1) {
   return Array.from(map.values());
 }
 
-/* ---------- Manga detail: improved chapter parsing ---------- */
+/* Manga detail extractor with decimal chapter support */
 async function extractMangaDetail(slug) {
   const safeSlug = sanitizeSlug(slug) || slug;
   const url = `${SITE_BASE}/Manhwa/${safeSlug}/`;
@@ -184,32 +178,27 @@ async function extractMangaDetail(slug) {
     if (t) genres.push(t);
   });
 
-  // find internalId from reader links if present
   let internalId = null;
   $('a').each((i, el) => {
     const href = $(el).attr('href') || '';
     if (href.includes('readerpage.php') && href.includes('Chapter=')) {
-      // match Chapter=<num or dec>,<internalId>
       const m = href.match(/Chapter=([0-9]+(?:\.[0-9]+)?),([^&'"]+)/);
       if (m && m[2]) internalId = m[2];
     }
   });
 
-  // chapters extraction with support for decimal chapter numbers
   const chapters = [];
   $('.chapter-item a, .chapter-list a, .chapters a').each((i, el) => {
     const href = $(el).attr('href') || '';
     if (!href) return;
     const text = $(el).text().trim();
-    // attempt to match Chapter=(number possibly decimal),id
     const match = href.match(/Chapter=([0-9]+(?:\.[0-9]+)?),([^&'"]+)/);
     let chapterId = null;
     let chapterNum = null;
     if (match) {
-      chapterId = match[1]; // keep as string like "1.34"
+      chapterId = match[1];
       chapterNum = Number(match[1]);
     } else {
-      // try to parse number from text like "Chapter 1.34" or "Ch. 1-34" etc.
       const m2 = text.match(/([0-9]+(?:\.[0-9]+)?)/);
       if (m2) {
         chapterId = m2[1];
@@ -223,7 +212,6 @@ async function extractMangaDetail(slug) {
     } catch (e) {}
   });
 
-  // fallback: also scan any anchor that might look like a reader link
   if (!chapters.length) {
     $('a').each((i, el) => {
       const href = $(el).attr('href') || '';
@@ -240,14 +228,12 @@ async function extractMangaDetail(slug) {
     });
   }
 
-  // dedupe by link, then sort desc by chapterNum (numeric) then by chapterId (string)
   const uniq = {};
   chapters.forEach(c => { if (c.link) uniq[c.link] = c; });
   const list = Object.values(uniq).sort((a, b) => {
     const an = (typeof a.chapterNum === 'number') ? a.chapterNum : -Infinity;
     const bn = (typeof b.chapterNum === 'number') ? b.chapterNum : -Infinity;
     if (an !== bn) return bn - an;
-    // fallback to lexicographic chapterId
     if (a.chapterId && b.chapterId) return (a.chapterId > b.chapterId) ? -1 : (a.chapterId < b.chapterId ? 1 : 0);
     return 0;
   });
@@ -255,10 +241,10 @@ async function extractMangaDetail(slug) {
   let cover = $('.cover img, .card-img-top, img').first().attr('src') || null;
   if (cover && !cover.startsWith('http')) cover = new URL(cover, SITE_BASE).href;
 
-  return { slug: sanitizeSlug(slug) || slug, title, description, genres, internalId, cover, chapters: list, url };
+  return { slug: safeSlug, title, description, genres, internalId, cover, chapters: list, url };
 }
 
-/* ---------- Reader page extraction & fallback ---------- */
+/* Reader pages extraction with script fallback */
 async function extractReaderPages(readerUrl) {
   const html = await fetchHtml(readerUrl);
   const $ = cheerio.load(html);
@@ -281,7 +267,6 @@ async function extractReaderPages(readerUrl) {
   }
 
   if (!imgs.length) {
-    // try script arrays
     const scripts = $('script').map((i, s) => $(s).html()).get().join('\n');
     const urlMatches = [...scripts.matchAll(/https?:\/\/[^'"\s]+?(?:webp|jpg|png)/g)].map(m => m[0]);
     if (urlMatches.length) imgs.push(...urlMatches);
@@ -290,11 +275,11 @@ async function extractReaderPages(readerUrl) {
   return Array.from(new Set(imgs.map(u => u && (u.startsWith('http') ? u : new URL(u, SITE_BASE).href)).filter(Boolean)));
 }
 
+/* fallback CDN builder and page-count discovery (binary search) */
 function buildFallbackPageUrl({ uid = '564', mangaName = '', chapter = '', page = 1 }) {
   const safe = encodeURIComponent(String(mangaName || '').replace(/\s+/g, '_'));
   return `https://${CDN_SAMPLE_HOST}/users/${uid}/${safe}/${chapter}/HD/${page}.webp`;
 }
-
 async function discoverPageCountByHead({ uid, mangaName, chapter }) {
   const maxCap = MAX_PAGE_CHECK;
   const url1 = buildFallbackPageUrl({ uid, mangaName, chapter, page: 1 });
@@ -321,11 +306,13 @@ async function discoverPageCountByHead({ uid, mangaName, chapter }) {
   return left;
 }
 
-/* ---------- API endpoints (stable shapes + alternatives) ---------- */
+/* -------------------------
+   API endpoints
+   ------------------------- */
 
 app.get('/api/home', async (req, res) => {
   try {
-    const page = parsePage(req.query.page || '1', 1, 1000);
+    const page = parsePage(req.query.page || '1', 1);
     const items = await extractHomePage(page);
     return res.json({ ok: true, page, items });
   } catch (e) {
@@ -336,7 +323,7 @@ app.get('/api/home', async (req, res) => {
 
 app.get('/api/genres', async (req, res) => {
   try {
-    const pages = Math.max(1, Math.min(parseInt(req.query.pages || '1', 10) || 1, MAX_GENRE_PAGES));
+    const pages = Math.max(1, Number(req.query.pages) || 1);
     const list = await extractGenres(pages);
     return res.json({ ok: true, pages, genres: list });
   } catch (e) {
@@ -347,14 +334,14 @@ app.get('/api/genres', async (req, res) => {
 
 /*
   GET /api/genre/:slug?page=1&pages=3
-  page = start page, pages = how many consecutive pages to fetch (e.g. page=2&pages=3 => fetch 2,3,4)
+  page = start page, pages = how many consecutive pages to fetch (page=2&pages=3 => 2,3,4)
 */
 app.get('/api/genre/:slug', async (req, res) => {
   try {
     const rawSlug = req.params.slug;
     const slug = sanitizeSlug(rawSlug) || rawSlug;
-    const startPage = parsePage(req.query.page || '1', 1, 100000);
-    const pages = Math.max(1, Math.min(parseInt(req.query.pages || '1', 10) || 1, MAX_GENRE_PAGES));
+    const startPage = parsePage(req.query.page || '1', 1);
+    const pages = Math.max(1, Number(req.query.pages) || 1);
     const pageNumbers = Array.from({ length: pages }, (_, i) => startPage + i);
 
     const fetches = pageNumbers.map(pn => (async () => {
@@ -387,7 +374,6 @@ app.get('/api/genre/:slug', async (req, res) => {
       else logErr(s.status === 'rejected' ? s.reason : 'unknown', '/api/genre/:slug fetch');
     }
 
-    // dedupe by link
     const uniq = {};
     merged.forEach(it => { if (it.link) uniq[it.link] = it; });
     const items = Object.values(uniq);
@@ -399,7 +385,7 @@ app.get('/api/genre/:slug', async (req, res) => {
   }
 });
 
-/* Manga detail - path and query both supported */
+/* Manga detail: path and query supported */
 app.get('/api/manga/:slug', async (req, res) => {
   try {
     const rawSlug = req.params.slug;
@@ -424,26 +410,19 @@ app.get('/api/manga', async (req, res) => {
   }
 });
 
-/*
-  Reader endpoints:
-   - GET /api/reader/:slug/:chapter
-   - GET /api/reader?slug=...&chapter=...
-  chapter can be "1", "1.34", "1_34" etc (we try to match intelligently).
-*/
-function normalizeChapterParam(ch) {
-  if (!ch) return null;
-  // unify underscores/dashes to dots if user sends 1_34 or 1-34 -> "1.34"
-  return String(ch).replace(/[_\-]/g, '.').trim();
-}
+/* Reader endpoints (both path and query). chapter accepts "1", "1.34", "1_34" */
 app.get('/api/reader/:slug/:chapter', async (req, res) => {
-  req.query.slug = req.params.slug;
-  req.query.chapter = req.params.chapter;
-  return app._router.handle(req, res); // delegate to query handler below
+  const q = { slug: req.params.slug, chapter: req.params.chapter };
+  return handleReaderQuery(q, res);
 });
 app.get('/api/reader', async (req, res) => {
+  return handleReaderQuery(req.query, res);
+});
+
+async function handleReaderQuery(query, res) {
   try {
-    const rawSlug = req.query.slug;
-    const rawChapter = req.query.chapter;
+    const rawSlug = query.slug;
+    const rawChapter = query.chapter;
     if (!rawSlug || !rawChapter) return res.status(400).json({ ok: false, error: 'slug and chapter required' });
 
     const slug = sanitizeSlug(rawSlug) || rawSlug;
@@ -451,18 +430,14 @@ app.get('/api/reader', async (req, res) => {
 
     const manga = await extractMangaDetail(slug);
 
-    // try to find chapter by multiple strategies:
     let chapterLink = null;
     let matchedChapter = null;
     if (manga.chapters && manga.chapters.length) {
-      // 1) exact chapterId match
       matchedChapter = manga.chapters.find(c => String(c.chapterId) === chapterParam);
-      // 2) numeric match (1.34 -> 1.34)
       if (!matchedChapter) {
         const n = Number(chapterParam);
         if (!Number.isNaN(n)) matchedChapter = manga.chapters.find(c => typeof c.chapterNum === 'number' && Math.abs(c.chapterNum - n) < 1e-6);
       }
-      // 3) title includes
       if (!matchedChapter) matchedChapter = manga.chapters.find(c => c.title && c.title.includes(chapterParam));
       if (matchedChapter) chapterLink = matchedChapter.link;
     }
@@ -472,7 +447,6 @@ app.get('/api/reader', async (req, res) => {
       if (pages && pages.length) return res.json({ ok: true, method: 'explicit', pages, pageCount: pages.length, matchedChapter });
     }
 
-    // fallback to internalId / CDN heuristics
     const uid = manga.internalId || null;
     const mangaName = manga.title || slug;
     if (uid) {
@@ -494,6 +468,20 @@ app.get('/api/reader', async (req, res) => {
     logErr(e, '/api/reader');
     return res.status(500).json({ ok: false, error: e.message });
   }
+}
+
+/* Health + root */
+app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
+app.get('/', (req, res) => {
+  res.type('html').send(`<html><body style="font-family:Arial"><h3>Manga API</h3>
+  <p>Examples:</p>
+  <ul>
+    <li>/api/manga/Death_is_the_only_ending_for_a_villainess</li>
+    <li>/api/reader?slug=Death_is_the_only_ending_for_a_villainess&chapter=1.34</li>
+    <li>/api/genre/action?page=1&pages=3</li>
+  </ul></body></html>`);
 });
 
-app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.n
+/* Start */
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
