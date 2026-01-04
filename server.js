@@ -1,137 +1,96 @@
-// app.js — updated (genre pagination, optional API token, input validation, better errors)
-// Deps: express, axios, cheerio, murmurhash3js (optional)
-// Install: npm i express axios cheerio murmurhash3js
+// app.js — improved: decimal chapters, genre pagination fix, query-based reader endpoints
+// Deps: express, axios, cheerio
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const murmur = require('murmurhash3js'); // optional, left for examples
-const path = require('path');
 
 const SITE_BASE = 'https://manhwa-tower.ir';
 const CDN_SAMPLE_HOST = 'cdn.megaman-server.ir';
 const MAX_PAGE_CHECK = 2000;
-const MAX_GENRE_PAGES = 20; // configurable ceiling for multi-page genre fetch
+const MAX_GENRE_PAGES = 50; // configurable ceiling
 
-const API_TOKEN = process.env.API_TOKEN || null; // set this env var to enable token auth
+const API_TOKEN = process.env.API_TOKEN || null;
 
 const app = express();
-// limit JSON body size to avoid huge payload attacks
 app.use(express.json({ limit: '100kb' }));
 
-/* -------------------------
-   Utilities
-   ------------------------- */
+/* ---------- Utilities ---------- */
 function logErr(err, ctx = '') {
-  console.error('[ERROR]', ctx, err && (err.stack || err.message || err));
+  console.error('[ERR]', ctx, err && (err.stack || err.message || err));
 }
-
 function sanitizeSlug(slug) {
   if (!slug || typeof slug !== 'string') return null;
-  // allow letters, numbers, hyphen, underscore; collapse multiple disallowed to '-'
+  // allow letters, numbers, underscore, hyphen; collapse sequences of other chars
   const m = slug.match(/[A-Za-z0-9\-_]+/g);
   return m ? m.join('-') : null;
 }
-
 function parsePage(q, fallback = 1, max = 1000) {
   const p = parseInt(q || String(fallback), 10);
   if (isNaN(p) || p < 1) return fallback;
   return Math.min(p, max);
 }
 
-/* -------------------------
-   Optional API token middleware
-   If process.env.API_TOKEN is set, require it. Otherwise allow open access.
-   Clients may send token via:
-     - header 'x-api-token'
-     - query 'api_token'
-     - Authorization: Bearer <token>
-   ------------------------- */
+/* ---------- Optional Token Middleware ---------- */
 app.use((req, res, next) => {
   try {
     if (!API_TOKEN) return next();
-    const fromHeader = req.header('x-api-token');
-    const fromQuery = req.query.api_token;
+    const header = req.header('x-api-token') || '';
+    const qtoken = req.query.api_token;
     const auth = req.header('authorization') || '';
     const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : null;
-    const token = fromHeader || fromQuery || bearer;
-    if (!token || token !== API_TOKEN) {
-      return res.status(401).json({ ok: false, error: 'Unauthorized: invalid or missing API token' });
-    }
+    const token = header || qtoken || bearer;
+    if (!token || token !== API_TOKEN) return res.status(401).json({ ok: false, error: 'Unauthorized: invalid or missing API token' });
     return next();
   } catch (e) {
-    logErr(e, 'auth-middleware');
+    logErr(e, 'auth');
     return res.status(500).json({ ok: false, error: 'internal' });
   }
 });
 
-/* -------------------------
-   Basic HTML fetcher (better error info)
-   ------------------------- */
+/* ---------- HTTP helpers ---------- */
 async function fetchHtml(url, timeout = 20000) {
   try {
-    const res = await axios.get(url, {
-      headers: { 'User-Agent': 'manga-prototype-bot/1.0 (+https://example)' },
+    const r = await axios.get(url, {
+      headers: { 'User-Agent': 'manga-proxy/1.0' },
       timeout,
       maxRedirects: 5,
-      validateStatus: status => status >= 200 && status < 400
+      validateStatus: s => s >= 200 && s < 400
     });
-    return res.data;
+    return r.data;
   } catch (e) {
-    // throw with context
-    const err = new Error(`Failed to fetch ${url}: ${e.message}`);
+    const err = new Error(`fetchHtml failed for ${url}: ${e.message}`);
     err.original = e;
     throw err;
   }
 }
-
-/* -------------------------
-   Exists checker (HEAD then small GET fallback)
-   ------------------------- */
 async function existsUrl(url, timeout = 8000) {
   try {
-    const res = await axios({
-      method: 'head',
-      url,
-      timeout,
-      maxRedirects: 3,
-      validateStatus: () => true
-    });
-    return res.status >= 200 && res.status < 300;
+    const r = await axios.head(url, { timeout, maxRedirects: 3, validateStatus: () => true });
+    return r.status >= 200 && r.status < 300;
   } catch (e) {
     try {
-      const res2 = await axios({
-        method: 'get',
-        url,
-        headers: { Range: 'bytes=0-32', 'User-Agent': 'manga-prototype-bot/1.0' },
-        timeout,
-        maxRedirects: 3,
-        validateStatus: () => true
-      });
-      return res2.status >= 200 && res2.status < 300;
-    } catch (e2) {
+      const r2 = await axios.get(url, { headers: { Range: 'bytes=0-32', 'User-Agent': 'manga-proxy/1.0' }, timeout, maxRedirects: 3, validateStatus: () => true });
+      return r2.status >= 200 && r2.status < 300;
+    } catch (_) {
       return false;
     }
   }
 }
 
-/* -------------------------
-   Extractors
-   ------------------------- */
+/* ---------- Extractors ---------- */
 
-/** Home page extractor */
 async function extractHomePage(page = 1) {
-  const url = page == 1 ? `${SITE_BASE}/page/1` : `${SITE_BASE}/page/${page}`;
+  const url = page === 1 ? `${SITE_BASE}/page/1` : `${SITE_BASE}/page/${page}`;
   const html = await fetchHtml(url);
   const $ = cheerio.load(html);
   const items = [];
-
   $('.manhwa-card').each((i, el) => {
     const a = $(el).find('a').first();
     const href = a.attr('href') || '';
     const link = href ? new URL(href, SITE_BASE).href : null;
     const title = a.attr('title') || a.text().trim() || $(el).find('.card-title').text().trim();
     let cover = $(el).find('img').attr('src') || $(el).find('.cover img').attr('src') || null;
-    if (cover) cover = cover.startsWith('http') ? cover : new URL(cover, SITE_BASE).href;
+    if (cover && !cover.startsWith('http')) cover = new URL(cover, SITE_BASE).href;
     let slug = null;
     if (link) {
       try {
@@ -142,8 +101,6 @@ async function extractHomePage(page = 1) {
     }
     if (link && title) items.push({ slug, title, cover, link });
   });
-
-  // fallback
   if (!items.length) {
     $('a[href*="/Manhwa/"]').each((i, el) => {
       const a = $(el);
@@ -155,21 +112,19 @@ async function extractHomePage(page = 1) {
         const idx = parts.findIndex(s => s.toLowerCase() === 'manhwa');
         const slug = (idx >= 0 && parts.length > idx + 1) ? parts[idx + 1] : parts[parts.length - 1];
         const cover = a.find('img').attr('src') || null;
-        items.push({ slug, title, cover: cover ? (cover.startsWith('http') ? cover : new URL(cover, SITE_BASE).href) : null, link: absolute });
+        const coverAbs = cover ? (cover.startsWith('http') ? cover : new URL(cover, SITE_BASE).href) : null;
+        items.push({ slug, title, cover: coverAbs, link: absolute });
       }
     });
   }
-
   return items;
 }
 
-/** Fixed extractGenres(): returns array of {name, slug, link} for a single page */
+/* ---------- Genres: page-by-page extractor ---------- */
 async function extractGenresPage(pageUrl = `${SITE_BASE}/gener.php`) {
   const html = await fetchHtml(pageUrl);
   const $ = cheerio.load(html);
   const genres = [];
-
-  // anchors semantically genre links:
   const anchors = $('a.genre-btn, a[href*="slug="], a[href*="gener.php"]');
   anchors.each((i, el) => {
     const href = $(el).attr('href') || '';
@@ -178,53 +133,37 @@ async function extractGenresPage(pageUrl = `${SITE_BASE}/gener.php`) {
     try {
       const resolved = new URL(href, pageUrl);
       const slug = resolved.searchParams.get('slug') || (() => {
-        // try to infer from path like gener.php/slug or /gener/slug
         const p = resolved.pathname.split('/').filter(Boolean);
-        if (p.length) return p[p.length - 1];
-        return null;
+        return p.length ? p[p.length - 1] : null;
       })();
       const link = resolved.href;
       if (slug) genres.push({ name, slug, link });
-    } catch (e) {
-      // ignore malformed hrefs
-    }
+    } catch (e) {}
   });
-
   // dedupe by slug
   const map = new Map();
   for (const g of genres) if (g.slug && !map.has(g.slug)) map.set(g.slug, g);
   return Array.from(map.values());
 }
 
-/** Multi-page genres aggregator */
-async function extractGenres(pages = 1) {
-  // pages - number of pagination pages to fetch on gener.php (1..MAX_GENRE_PAGES)
-  const p = Math.max(1, Math.min(Number(pages) || 1, MAX_GENRE_PAGES));
-  const pageUrls = [];
+async function extractGenres(totalPages = 1) {
+  const p = Math.max(1, Math.min(Number(totalPages) || 1, MAX_GENRE_PAGES));
+  const urls = [];
   for (let i = 1; i <= p; i++) {
-    // Many sites use gener.php?page=N or gener.php?slug=&page=N — for the generic genre index we try gener.php?page=N
-    const u = `${SITE_BASE}/gener.php${i > 1 ? '?page=' + i : ''}`;
-    pageUrls.push(u);
+    urls.push(`${SITE_BASE}/gener.php${i > 1 ? '?page=' + i : ''}`);
   }
-
-  const results = await Promise.allSettled(pageUrls.map(u => extractGenresPage(u)));
+  const settled = await Promise.allSettled(urls.map(u => extractGenresPage(u)));
   const merged = [];
-  for (const r of results) {
-    if (r.status === 'fulfilled' && Array.isArray(r.value)) {
-      for (const g of r.value) merged.push(g);
-    } else {
-      // log but continue
-      logErr(r.status === 'rejected' ? r.reason : 'unknown', 'extractGenres (page fetch)');
-    }
+  for (const s of settled) {
+    if (s.status === 'fulfilled' && Array.isArray(s.value)) merged.push(...s.value);
+    else logErr(s.status === 'rejected' ? s.reason : 'unknown', 'extractGenres');
   }
-
-  // Final dedupe by slug, keep first occurrence
   const map = new Map();
   for (const g of merged) if (g.slug && !map.has(g.slug)) map.set(g.slug, g);
   return Array.from(map.values());
 }
 
-/** Manga detail extractor */
+/* ---------- Manga detail: improved chapter parsing ---------- */
 async function extractMangaDetail(slug) {
   const safeSlug = sanitizeSlug(slug) || slug;
   const url = `${SITE_BASE}/Manhwa/${safeSlug}/`;
@@ -245,91 +184,106 @@ async function extractMangaDetail(slug) {
     if (t) genres.push(t);
   });
 
-  // internalId (B in Chapter=A,B)
+  // find internalId from reader links if present
   let internalId = null;
   $('a').each((i, el) => {
     const href = $(el).attr('href') || '';
     if (href.includes('readerpage.php') && href.includes('Chapter=')) {
-      const m = href.match(/Chapter=[^,]+,([^&'"]+)/);
-      if (m && m[1]) internalId = m[1];
+      // match Chapter=<num or dec>,<internalId>
+      const m = href.match(/Chapter=([0-9]+(?:\.[0-9]+)?),([^&'"]+)/);
+      if (m && m[2]) internalId = m[2];
     }
   });
 
-  // chapters
+  // chapters extraction with support for decimal chapter numbers
   const chapters = [];
-  $('.chapter-item a, .chapter-list a, .chapters a, a').each((i, el) => {
+  $('.chapter-item a, .chapter-list a, .chapters a').each((i, el) => {
     const href = $(el).attr('href') || '';
-    if (href.includes('readerpage.php') && href.includes('Chapter=')) {
-      const text = $(el).text().trim();
-      const match = href.match(/Chapter=(\d+),([^&'"]+)/);
-      let chapterNum = null;
-      if (match) chapterNum = parseInt(match[1], 10);
-      try {
-        const absolute = new URL(href, SITE_BASE).href;
-        chapters.push({ chapterNum, title: text || (chapterNum ? `Chapter ${chapterNum}` : `#${i+1}`), link: absolute });
-      } catch (e) {}
+    if (!href) return;
+    const text = $(el).text().trim();
+    // attempt to match Chapter=(number possibly decimal),id
+    const match = href.match(/Chapter=([0-9]+(?:\.[0-9]+)?),([^&'"]+)/);
+    let chapterId = null;
+    let chapterNum = null;
+    if (match) {
+      chapterId = match[1]; // keep as string like "1.34"
+      chapterNum = Number(match[1]);
+    } else {
+      // try to parse number from text like "Chapter 1.34" or "Ch. 1-34" etc.
+      const m2 = text.match(/([0-9]+(?:\.[0-9]+)?)/);
+      if (m2) {
+        chapterId = m2[1];
+        chapterNum = Number(m2[1]);
+      }
     }
+    try {
+      const absolute = new URL(href, SITE_BASE).href;
+      const titleFallback = text || (chapterId ? `Chapter ${chapterId}` : `#${i+1}`);
+      chapters.push({ chapterId: chapterId || String(i+1), chapterNum: isFinite(chapterNum) ? chapterNum : null, title: titleFallback, link: absolute });
+    } catch (e) {}
   });
 
-  // dedupe + sort desc
+  // fallback: also scan any anchor that might look like a reader link
+  if (!chapters.length) {
+    $('a').each((i, el) => {
+      const href = $(el).attr('href') || '';
+      if (href.includes('readerpage.php')) {
+        const text = $(el).text().trim() || `#${i+1}`;
+        const match = href.match(/Chapter=([0-9]+(?:\.[0-9]+)?),([^&'"]+)/);
+        let chapterId = match ? match[1] : String(i+1);
+        let chapterNum = match ? Number(match[1]) : null;
+        try {
+          const absolute = new URL(href, SITE_BASE).href;
+          chapters.push({ chapterId, chapterNum: isFinite(chapterNum) ? chapterNum : null, title: text, link: absolute });
+        } catch (e) {}
+      }
+    });
+  }
+
+  // dedupe by link, then sort desc by chapterNum (numeric) then by chapterId (string)
   const uniq = {};
   chapters.forEach(c => { if (c.link) uniq[c.link] = c; });
-  const list = Object.values(uniq).sort((a, b) => (b.chapterNum || 0) - (a.chapterNum || 0));
+  const list = Object.values(uniq).sort((a, b) => {
+    const an = (typeof a.chapterNum === 'number') ? a.chapterNum : -Infinity;
+    const bn = (typeof b.chapterNum === 'number') ? b.chapterNum : -Infinity;
+    if (an !== bn) return bn - an;
+    // fallback to lexicographic chapterId
+    if (a.chapterId && b.chapterId) return (a.chapterId > b.chapterId) ? -1 : (a.chapterId < b.chapterId ? 1 : 0);
+    return 0;
+  });
 
   let cover = $('.cover img, .card-img-top, img').first().attr('src') || null;
-  if (cover) cover = cover.startsWith('http') ? cover : new URL(cover, SITE_BASE).href;
+  if (cover && !cover.startsWith('http')) cover = new URL(cover, SITE_BASE).href;
 
-  return { slug: safeSlug, title, description, genres, internalId, cover, chapters: list, url };
+  return { slug: sanitizeSlug(slug) || slug, title, description, genres, internalId, cover, chapters: list, url };
 }
 
-/* -------------------------
-   Reader + page count discovery
-   ------------------------- */
-
+/* ---------- Reader page extraction & fallback ---------- */
 async function extractReaderPages(readerUrl) {
   const html = await fetchHtml(readerUrl);
   const $ = cheerio.load(html);
   const imgs = [];
 
-  // common selectors
   $('img.manhwa-image').each((i, el) => {
     const src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-lazy-src');
     if (src) imgs.push(src.startsWith('http') ? src : new URL(src, SITE_BASE).href);
   });
 
   if (!imgs.length) {
-    $('.mhreader, .mhreader-overlay, .reader, .reader-content').find('img').each((i, el) => {
-      const src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-lazy-src');
-      if (src) imgs.push(src.startsWith('http') ? src : new URL(src, SITE_BASE).href);
-    });
-  }
-
-  // general fallback: any images that look like pages
-  if (!imgs.length) {
-    $('img').each((i, el) => {
-      const src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-srcset') || $(el).attr('srcset');
-      if (src && (src.includes('cdn.') || src.includes('/users/') || src.endsWith('.webp') || src.endsWith('.jpg') || src.endsWith('.png'))) {
-        // if srcset present, take first URL
+    $('.mhreader, .reader, .reader-content').find('img').each((i, el) => {
+      const src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-lazy-src') || $(el).attr('srcset');
+      if (src) {
         let chosen = src;
-        if (src.includes(',')) {
-          chosen = src.split(',')[0].trim().split(' ')[0];
-        }
+        if (chosen.includes(',')) chosen = chosen.split(',')[0].trim().split(' ')[0];
         imgs.push(chosen.startsWith('http') ? chosen : new URL(chosen, SITE_BASE).href);
       }
     });
   }
 
-  // if still empty, try to scrape scripts for image arrays
   if (!imgs.length) {
+    // try script arrays
     const scripts = $('script').map((i, s) => $(s).html()).get().join('\n');
-    const arrMatch = scripts.match(/\[\"(https?:\/\/[^"]+?\.(?:jpg|png|webp))\"(?:,\s*\"https?:\/\/[^"]+?\.(?:jpg|png|webp)\")+\]/);
-    if (arrMatch) {
-      try {
-        const jsonArr = JSON.parse(arrMatch[0].replace(/\s/g, ''));
-        if (Array.isArray(jsonArr)) imgs.push(...jsonArr);
-      } catch (e) {}
-    }
-    const urlMatches = [...(scripts.matchAll(/https?:\/\/[^'"\s]+?(?:webp|jpg|png)/g))].map(m => m[0]);
+    const urlMatches = [...scripts.matchAll(/https?:\/\/[^'"\s]+?(?:webp|jpg|png)/g)].map(m => m[0]);
     if (urlMatches.length) imgs.push(...urlMatches);
   }
 
@@ -356,22 +310,18 @@ async function discoverPageCountByHead({ uid, mangaName, chapter }) {
     if (high > maxCap) { high = maxCap; break; }
   }
 
-  const highUrl = buildFallbackPageUrl({ uid, mangaName, chapter, page: high });
-  if (await existsUrl(highUrl)) return high;
+  if (await existsUrl(buildFallbackPageUrl({ uid, mangaName, chapter, page: high }))) return high;
 
   let left = low, right = high;
   while (left + 1 < right) {
     const mid = Math.floor((left + right) / 2);
-    const midUrl = buildFallbackPageUrl({ uid, mangaName, chapter, page: mid });
-    if (await existsUrl(midUrl)) left = mid;
+    if (await existsUrl(buildFallbackPageUrl({ uid, mangaName, chapter, page: mid }))) left = mid;
     else right = mid;
   }
   return left;
 }
 
-/* -------------------------
-   API endpoints
-   ------------------------- */
+/* ---------- API endpoints (stable shapes + alternatives) ---------- */
 
 app.get('/api/home', async (req, res) => {
   try {
@@ -386,7 +336,6 @@ app.get('/api/home', async (req, res) => {
 
 app.get('/api/genres', async (req, res) => {
   try {
-    // optional pages param to aggregate multiple pages of the genre index
     const pages = Math.max(1, Math.min(parseInt(req.query.pages || '1', 10) || 1, MAX_GENRE_PAGES));
     const list = await extractGenres(pages);
     return res.json({ ok: true, pages, genres: list });
@@ -396,15 +345,18 @@ app.get('/api/genres', async (req, res) => {
   }
 });
 
+/*
+  GET /api/genre/:slug?page=1&pages=3
+  page = start page, pages = how many consecutive pages to fetch (e.g. page=2&pages=3 => fetch 2,3,4)
+*/
 app.get('/api/genre/:slug', async (req, res) => {
   try {
     const rawSlug = req.params.slug;
     const slug = sanitizeSlug(rawSlug) || rawSlug;
-    const page = parsePage(req.query.page || '1', 1, 1000);
-    const pages = Math.max(1, Math.min(parseInt(req.query.pages || String(page), 10) || page, MAX_GENRE_PAGES));
+    const startPage = parsePage(req.query.page || '1', 1, 100000);
+    const pages = Math.max(1, Math.min(parseInt(req.query.pages || '1', 10) || 1, MAX_GENRE_PAGES));
+    const pageNumbers = Array.from({ length: pages }, (_, i) => startPage + i);
 
-    // if pages>1, fetch pages 1..pages and merge items
-    const pageNumbers = Array.from({ length: pages }, (_, i) => i + (page === 1 ? 1 : page) ); // e.g. if page=2 and pages=3 -> [2,3,4]
     const fetches = pageNumbers.map(pn => (async () => {
       const url = `${SITE_BASE}/gener.php?slug=${encodeURIComponent(slug)}${pn > 1 ? '&page=' + pn : ''}`;
       const html = await fetchHtml(url);
@@ -416,7 +368,7 @@ app.get('/api/genre/:slug', async (req, res) => {
         const link = href ? new URL(href, SITE_BASE).href : null;
         const title = a.attr('title') || a.text().trim() || $(el).find('.card-title').text().trim();
         let cover = $(el).find('img').attr('src') || null;
-        if (cover) cover = cover.startsWith('http') ? cover : new URL(cover, SITE_BASE).href;
+        if (cover && !cover.startsWith('http')) cover = new URL(cover, SITE_BASE).href;
         let slugInfer = null;
         if (link) {
           const parts = new URL(link).pathname.split('/').filter(Boolean);
@@ -432,7 +384,7 @@ app.get('/api/genre/:slug', async (req, res) => {
     const merged = [];
     for (const s of settled) {
       if (s.status === 'fulfilled' && Array.isArray(s.value)) merged.push(...s.value);
-      else logErr(s.status === 'rejected' ? s.reason : 'unknown', '/api/genre/:slug page fetch');
+      else logErr(s.status === 'rejected' ? s.reason : 'unknown', '/api/genre/:slug fetch');
     }
 
     // dedupe by link
@@ -440,13 +392,14 @@ app.get('/api/genre/:slug', async (req, res) => {
     merged.forEach(it => { if (it.link) uniq[it.link] = it; });
     const items = Object.values(uniq);
 
-    return res.json({ ok: true, genre: slug, requestedPage: page, pagesFetched: pages, items });
+    return res.json({ ok: true, genre: slug, startPage, pagesFetched: pageNumbers.length, items });
   } catch (e) {
     logErr(e, '/api/genre/:slug');
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
+/* Manga detail - path and query both supported */
 app.get('/api/manga/:slug', async (req, res) => {
   try {
     const rawSlug = req.params.slug;
@@ -458,30 +411,68 @@ app.get('/api/manga/:slug', async (req, res) => {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
-
-app.get('/api/reader/:slug/:chapter', async (req, res) => {
+app.get('/api/manga', async (req, res) => {
   try {
-    const rawSlug = req.params.slug;
+    const rawSlug = req.query.slug;
+    if (!rawSlug) return res.status(400).json({ ok: false, error: 'missing slug query' });
     const slug = sanitizeSlug(rawSlug) || rawSlug;
-    const chapterParam = String(req.params.chapter || '').trim();
-    const chapterNum = parseInt(chapterParam, 10);
-    if (!chapterParam) return res.status(400).json({ ok: false, error: 'chapter required' });
+    const detail = await extractMangaDetail(slug);
+    return res.json({ ok: true, manga: detail });
+  } catch (e) {
+    logErr(e, '/api/manga(query)');
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/*
+  Reader endpoints:
+   - GET /api/reader/:slug/:chapter
+   - GET /api/reader?slug=...&chapter=...
+  chapter can be "1", "1.34", "1_34" etc (we try to match intelligently).
+*/
+function normalizeChapterParam(ch) {
+  if (!ch) return null;
+  // unify underscores/dashes to dots if user sends 1_34 or 1-34 -> "1.34"
+  return String(ch).replace(/[_\-]/g, '.').trim();
+}
+app.get('/api/reader/:slug/:chapter', async (req, res) => {
+  req.query.slug = req.params.slug;
+  req.query.chapter = req.params.chapter;
+  return app._router.handle(req, res); // delegate to query handler below
+});
+app.get('/api/reader', async (req, res) => {
+  try {
+    const rawSlug = req.query.slug;
+    const rawChapter = req.query.chapter;
+    if (!rawSlug || !rawChapter) return res.status(400).json({ ok: false, error: 'slug and chapter required' });
+
+    const slug = sanitizeSlug(rawSlug) || rawSlug;
+    const chapterParam = normalizeChapterParam(rawChapter);
 
     const manga = await extractMangaDetail(slug);
 
+    // try to find chapter by multiple strategies:
     let chapterLink = null;
+    let matchedChapter = null;
     if (manga.chapters && manga.chapters.length) {
-      const found = manga.chapters.find(c => String(c.chapterNum) === String(chapterParam) || (c.title && c.title.includes(String(chapterParam))));
-      if (found) chapterLink = found.link;
+      // 1) exact chapterId match
+      matchedChapter = manga.chapters.find(c => String(c.chapterId) === chapterParam);
+      // 2) numeric match (1.34 -> 1.34)
+      if (!matchedChapter) {
+        const n = Number(chapterParam);
+        if (!Number.isNaN(n)) matchedChapter = manga.chapters.find(c => typeof c.chapterNum === 'number' && Math.abs(c.chapterNum - n) < 1e-6);
+      }
+      // 3) title includes
+      if (!matchedChapter) matchedChapter = manga.chapters.find(c => c.title && c.title.includes(chapterParam));
+      if (matchedChapter) chapterLink = matchedChapter.link;
     }
 
     if (chapterLink) {
       const pages = await extractReaderPages(chapterLink);
-      if (pages && pages.length) {
-        return res.json({ ok: true, method: 'explicit', pages, pageCount: pages.length });
-      }
+      if (pages && pages.length) return res.json({ ok: true, method: 'explicit', pages, pageCount: pages.length, matchedChapter });
     }
 
+    // fallback to internalId / CDN heuristics
     const uid = manga.internalId || null;
     const mangaName = manga.title || slug;
     if (uid) {
@@ -489,28 +480,20 @@ app.get('/api/reader/:slug/:chapter', async (req, res) => {
       if (pageCount && pageCount > 0) {
         const pages = [];
         for (let i = 1; i <= pageCount; i++) pages.push(buildFallbackPageUrl({ uid, mangaName, chapter: chapterParam, page: i }));
-        return res.json({ ok: true, method: 'fallback-discovered', pages, pageCount });
+        return res.json({ ok: true, method: 'fallback-discovered', pages, pageCount, matchedChapter: matchedChapter || null });
       } else {
         const guessed = [];
         const guessCount = 25;
         for (let i = 1; i <= guessCount; i++) guessed.push(buildFallbackPageUrl({ uid, mangaName, chapter: chapterParam, page: i }));
-        return res.json({ ok: true, method: 'fallback-guess', pages: guessed, note: 'exact pageCount could not be discovered; returned guessed first pages; consider Playwright if site uses heavy JS.' });
+        return res.json({ ok: true, method: 'fallback-guess', pages: guessed, note: 'could not discover exact pageCount', matchedChapter: matchedChapter || null });
       }
     }
 
-    return res.status(422).json({ ok: false, error: 'Could not extract pages. Ensure the manga slug is correct and site does not rely on heavy JS.' });
-
+    return res.status(422).json({ ok: false, error: 'Could not extract pages. Ensure slug correct or site uses JS-heavy reader.' });
   } catch (e) {
-    logErr(e, '/api/reader/:slug/:chapter');
+    logErr(e, '/api/reader');
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
-
-app.get('/', (req, res) => {
-  res.type('html').send(`<html><body style="font-family:Arial"><h3>Manga API (live)</h3><p>Endpoints: /api/home?page=1 • /api/genres?pages=1 • /api/genre/:slug?page=N&pages=M • /api/manga/:slug • /api/reader/:slug/:chapter</p></body></html>`);
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running http://localhost:${PORT} — live extraction mode.`));
+app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.n
