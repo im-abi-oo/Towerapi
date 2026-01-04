@@ -70,7 +70,7 @@ async function existsUrl(url, timeout = 8000) {
    Extractors (improved)
    ------------------------- */
 
-/* --- 1) extractHomePage: try several pagination patterns, robust dedupe --- */
+/* --- extractHomePage: try several pagination patterns, robust dedupe --- */
 async function extractHomePage(page = 1) {
   const candidates = [
     `${SITE_BASE}/page/${page}`,
@@ -110,7 +110,7 @@ async function extractHomePage(page = 1) {
     if (link && title) map.set(link, { link, title, cover });
   });
 
-  // Fallback: anchors linking to /Manhwa/, /manhwa/, /manga/
+  // Fallback: anchors
   $('a[href]').each((i, el) => {
     const a = $(el);
     const href = a.attr('href') || '';
@@ -126,7 +126,7 @@ async function extractHomePage(page = 1) {
     } catch (e) {}
   });
 
-  // Another fallback: article/card blocks
+  // Article/card blocks
   $('article, .post, .card').each((i, el) => {
     const a = $(el).find('a[href*="/Manhwa/"], a[href*="/manhwa/"], a[href*="/manga/"]').first();
     if (!a || !a.attr) return;
@@ -146,13 +146,12 @@ async function extractHomePage(page = 1) {
   return items;
 }
 
-/* --- 2) extractGenresPage: robust genre link detection --- */
+/* --- extractGenresPage: robust genre link detection --- */
 async function extractGenresPage(pageUrl = `${SITE_BASE}/gener.php`) {
   const html = await fetchHtml(pageUrl);
   const $ = cheerio.load(html);
   const genres = [];
 
-  // Generic anchors that look like genre links
   $('a').each((i, el) => {
     const href = $(el).attr('href') || '';
     const text = $(el).text().trim();
@@ -169,7 +168,6 @@ async function extractGenresPage(pageUrl = `${SITE_BASE}/gener.php`) {
     }
   });
 
-  // Lists like ul.genre-list, .tags
   $('ul, .genre-list, .tags').find('a').each((i, el) => {
     const href = $(el).attr('href') || '';
     const text = $(el).text().trim();
@@ -186,7 +184,6 @@ async function extractGenresPage(pageUrl = `${SITE_BASE}/gener.php`) {
   return Array.from(map.values());
 }
 
-/* aggregate multiple genre pages */
 async function extractGenres(totalPages = 1) {
   const p = Math.max(1, Number(totalPages) || 1);
   const urls = [];
@@ -204,7 +201,7 @@ async function extractGenres(totalPages = 1) {
   return Array.from(map.values());
 }
 
-/* --- 3) extractMangaDetail: decimal chapter support, better chapter detection --- */
+/* --- extractMangaDetail: decimal chapter support --- */
 async function extractMangaDetail(slug) {
   const safeSlug = sanitizeSlug(slug) || slug;
   const url = `${SITE_BASE}/Manhwa/${safeSlug}/`;
@@ -291,13 +288,13 @@ async function extractMangaDetail(slug) {
   return { slug: safeSlug, title, description, genres, internalId, cover, chapters: list, url };
 }
 
-/* --- 4) extractReaderPages: much stronger extraction (noscript, iframe, script arrays, srcset) --- */
+/* --- extractReaderPages: stronger extraction --- */
 async function extractReaderPages(readerUrl) {
   const html = await fetchHtml(readerUrl);
   const $ = cheerio.load(html);
   const imgs = [];
 
-  // 1) direct reader images by common selectors
+  // direct selectors
   $('img.manhwa-image, img.reader-img, .reader img, .mhreader img').each((i, el) => {
     const src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-lazy-src') || $(el).attr('data-srcset') || $(el).attr('srcset');
     if (!src) return;
@@ -307,7 +304,7 @@ async function extractReaderPages(readerUrl) {
     imgs.push(chosen);
   });
 
-  // 2) noscript blocks
+  // noscript
   $('noscript').each((i, el) => {
     const inner = $(el).html() || '';
     const $$ = cheerio.load(inner);
@@ -317,7 +314,7 @@ async function extractReaderPages(readerUrl) {
     });
   });
 
-  // 3) iframe: fetch iframe and parse its images
+  // iframe
   const iframeSrc = $('iframe[src]').first().attr('src');
   if (iframeSrc) {
     try {
@@ -331,7 +328,7 @@ async function extractReaderPages(readerUrl) {
     } catch (e) { logErr(e, 'iframe fetch in extractReaderPages'); }
   }
 
-  // 4) script arrays / inline JSON with images
+  // scripts: arrays and url matches
   const scripts = $('script').map((i, s) => $(s).html()).get().join('\n') || '';
   const arrMatches = [...scripts.matchAll(/\[\s*["'](https?:\/\/[^"']+\.(?:jpg|jpeg|png|webp))["'](?:\s*,\s*["']https?:\/\/[^"']+\.(?:jpg|jpeg|png|webp)["'])+\s*\]/g)];
   for (const m of arrMatches) {
@@ -341,11 +338,10 @@ async function extractReaderPages(readerUrl) {
       if (Array.isArray(parsed)) parsed.forEach(u => imgs.push(u));
     } catch (e) {}
   }
-  // any url-like matches in scripts
   const urlMatches = [...scripts.matchAll(/https?:\/\/[^'"\s]+?(?:webp|jpg|jpeg|png)/g)].map(m => m[0]);
   urlMatches.forEach(u => imgs.push(u));
 
-  // 5) final generic <img> fallback
+  // final fallback generic <img>
   if (!imgs.length) {
     $('img').each((i, el) => {
       const src = $(el).attr('src') || $(el).attr('data-src');
@@ -353,7 +349,6 @@ async function extractReaderPages(readerUrl) {
     });
   }
 
-  // normalize and dedupe
   const cleaned = Array.from(new Set(imgs.map(u => {
     if (!u) return null;
     const s = String(u).trim();
@@ -363,7 +358,7 @@ async function extractReaderPages(readerUrl) {
   return cleaned;
 }
 
-/* --- 5) fallback CDN builder + binary search for page count --- */
+/* --- fallback CDN builder + binary search for page count --- */
 function buildFallbackPageUrl({ uid = '564', mangaName = '', chapter = '', page = 1 }) {
   const safe = encodeURIComponent(String(mangaName || '').replace(/\s+/g, '_'));
   return `https://${CDN_SAMPLE_HOST}/users/${uid}/${safe}/${chapter}/HD/${page}.webp`;
@@ -395,16 +390,112 @@ async function discoverPageCountByHead({ uid, mangaName, chapter }) {
 }
 
 /* -------------------------
+   Popular & Recommendations logic
+   ------------------------- */
+
+const POPULAR_TTL_MS = 5 * 60 * 1000; // 5 minutes cache
+const MAX_POPULAR = 10; // fixed popular pool for /api/popular
+let _popularCache = { ts: 0, items: [], count: 0 };
+
+async function fetchPopularItems(count = MAX_POPULAR) {
+  const want = Math.max(1, Math.min(Number(count) || MAX_POPULAR, MAX_POPULAR));
+  const now = Date.now();
+  if (_popularCache.ts && (now - _popularCache.ts) < POPULAR_TTL_MS && _popularCache.count === want) {
+    return _popularCache.items.slice(0, want);
+  }
+
+  try {
+    const pageItems = await extractHomePage(1);
+    const seen = new Set();
+    const out = [];
+    for (const it of pageItems) {
+      const key = (it.link || it.title || '').trim();
+      if (!key) continue;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(it);
+      if (out.length >= want) break;
+    }
+    _popularCache = { ts: now, items: out, count: want };
+    return out;
+  } catch (e) {
+    logErr(e, 'fetchPopularItems');
+    return [];
+  }
+}
+
+function isPopularItem(item, popularSet) {
+  if (!item) return false;
+  const k = (item.link || item.title || '').trim();
+  return popularSet.has(k);
+}
+
+// fetch aggregated home items from pages 1..n
+async function fetchHomePages(pages = 3, maxItems = 500) {
+  const p = Math.max(1, Math.min(Number(pages) || 1, 20)); // cap pool pages to 20
+  const map = new Map();
+  for (let i = 1; i <= p; i++) {
+    try {
+      const items = await extractHomePage(i);
+      for (const it of items) {
+        const key = (it.link || it.title || '').trim();
+        if (!key) continue;
+        if (!map.has(key)) map.set(key, it);
+        if (map.size >= maxItems) break;
+      }
+    } catch (e) {
+      logErr(e, `fetchHomePages page ${i}`);
+    }
+    if (map.size >= maxItems) break;
+  }
+  return Array.from(map.values());
+}
+
+// deterministic RNG & shuffle (simple xorshift-like)
+function seededRng(seed) {
+  let x = seed >>> 0;
+  return function() {
+    x ^= x << 13; x = x >>> 0;
+    x ^= x >>> 17; x = x >>> 0;
+    x ^= x << 5; x = x >>> 0;
+    return (x >>> 0) / 4294967295;
+  };
+}
+function seededShuffle(array, seed) {
+  const a = array.slice();
+  const rnd = seededRng(seed);
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+/* -------------------------
    API endpoints
    ------------------------- */
 
 app.get('/api/home', async (req, res) => {
   try {
     const page = parsePage(req.query.page || '1', 1);
-    const items = await extractHomePage(page);
-    return res.json({ ok: true, page, items });
+    const ex = req.query.exclude_popular;
+    const excludePopular = ex === '1' || String(ex).toLowerCase() === 'true' || ex === 'yes';
+
+    let items = await extractHomePage(page);
+    let filteredOut = 0;
+
+    if (excludePopular) {
+      const count = Math.max(1, Math.min(Number(req.query.popular_count) || MAX_POPULAR, MAX_POPULAR));
+      const popular = await fetchPopularItems(count);
+      const popSet = new Set(popular.map(p => (p.link || p.title || '').trim()));
+      const before = items.length;
+      items = items.filter(it => !isPopularItem(it, popSet));
+      filteredOut = before - items.length;
+    }
+
+    return res.json({ ok: true, page, items, excludePopular: !!excludePopular, filteredOut });
   } catch (e) {
-    logErr(e, '/api/home');
+    logErr(e, '/api/home (with exclude_popular)');
     return res.status(500).json({ ok: false, error: e.message || 'internal' });
   }
 });
@@ -420,10 +511,6 @@ app.get('/api/genres', async (req, res) => {
   }
 });
 
-/*
-  GET /api/genre/:slug?page=1&pages=3
-  page = start page, pages = how many consecutive pages to fetch
-*/
 app.get('/api/genre/:slug', async (req, res) => {
   try {
     const rawSlug = req.params.slug;
@@ -437,7 +524,6 @@ app.get('/api/genre/:slug', async (req, res) => {
       const html = await fetchHtml(url);
       const $ = cheerio.load(html);
       const items = [];
-      // try same robust scraping logic as home
       $('.manhwa-card').each((i, el) => {
         const a = $(el).find('a').first();
         const href = a.attr('href') || '';
@@ -576,6 +662,46 @@ async function handleReaderQuery(query, res) {
   }
 }
 
+/* Popular endpoint */
+app.get('/api/popular', async (req, res) => {
+  try {
+    const count = Math.max(1, Math.min(Number(req.query.count) || MAX_POPULAR, MAX_POPULAR));
+    const items = await fetchPopularItems(count);
+    return res.json({ ok: true, count: items.length, items });
+  } catch (e) {
+    logErr(e, '/api/popular');
+    return res.status(500).json({ ok: false, error: e.message || 'internal' });
+  }
+});
+
+/* Recommendations: pick from pooled home pages (deterministic per-day) */
+/*
+  GET /api/recommendations?count=5&pool_pages=3
+  - count default 5, max 5
+  - pool_pages default 3, max 20
+*/
+app.get('/api/recommendations', async (req, res) => {
+  try {
+    const want = Math.max(1, Math.min(Number(req.query.count) || 5, 5));
+    const poolPages = Math.max(1, Math.min(Number(req.query.pool_pages) || 3, 20));
+
+    const pool = await fetchHomePages(poolPages, 1000); // gather up to 1000 unique items
+    if (!pool.length) return res.json({ ok: true, date: null, count: 0, items: [] });
+
+    // seed by date so selections rotate daily but are stable for that day
+    const now = new Date();
+    const seedStr = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}`;
+    const seed = Number(seedStr);
+    const shuffled = seededShuffle(pool, seed);
+    const picks = shuffled.slice(0, Math.min(want, shuffled.length));
+
+    return res.json({ ok: true, date: seedStr, poolPages, poolSize: pool.length, count: picks.length, items: picks });
+  } catch (e) {
+    logErr(e, '/api/recommendations');
+    return res.status(500).json({ ok: false, error: e.message || 'internal' });
+  }
+});
+
 /* Health + root */
 app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
 app.get('/', (req, res) => {
@@ -585,6 +711,8 @@ app.get('/', (req, res) => {
     <li>/api/manga/Death_is_the_only_ending_for_a_villainess</li>
     <li>/api/reader?slug=Death_is_the_only_ending_for_a_villainess&chapter=1.34</li>
     <li>/api/genre/action?page=1&pages=3</li>
+    <li>/api/popular</li>
+    <li>/api/recommendations?count=5&pool_pages=3</li>
   </ul></body></html>`);
 });
 
