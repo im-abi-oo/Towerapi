@@ -477,13 +477,17 @@ function seededShuffle(array, seed) {
 
 app.get('/api/home', async (req, res) => {
   try {
-    const page = parsePage(req.query.page || '1', 1);
+    const page = parsePage(req.query.page, 1);
     const ex = req.query.exclude_popular;
     const excludePopular = ex === '1' || String(ex).toLowerCase() === 'true' || ex === 'yes';
 
     let items = await extractHomePage(page);
-    const filteredItems = items.slice(10);
     let filteredOut = 0;
+
+    // فقط اگر query page مشخص باشه، ۱۰ تای اول رو حذف کن
+    if (req.query.page) {
+      items = items.slice(10);
+    }
 
     if (excludePopular) {
       const count = Math.max(1, Math.min(Number(req.query.popular_count) || MAX_POPULAR, MAX_POPULAR));
