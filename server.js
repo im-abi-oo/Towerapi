@@ -1,10 +1,14 @@
-// server.js — full updated version
-// Deps: express, axios, cheerio
-// npm i express axios cheerio
-
+// server.js — full updated + static serving
+// Deps: express, axios, cheerio, compression, helmet, morgan, cors
+// npm i express axios cheerio compression helmet morgan cors
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const path = require('path');
+const compression = require('compression');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const cors = require('cors');
 
 const SITE_BASE = 'https://manhwa-tower.ir';
 const CDN_SAMPLE_HOST = 'cdn.megaman-server.ir';
@@ -12,6 +16,15 @@ const MAX_PAGE_CHECK = 2000;
 
 const app = express();
 app.use(express.json({ limit: '200kb' }));
+
+// security & perf & logging & cors for front (same origin but ok)
+app.use(compression());
+app.use(helmet());
+app.use(morgan('tiny'));
+app.use(cors());
+
+// serve frontend static files from /public
+app.use(express.static(path.join(__dirname, 'public'), { maxAge: '1d' }));
 
 /* -------------------------
    Utilities
@@ -720,18 +733,15 @@ app.get('/api/recommendations', async (req, res) => {
 });
 
 /* Health + root */
-app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
+/* serve SPA index.html for root */
 app.get('/', (req, res) => {
-  res.type('html').send(`<html><body style="font-family:Arial"><h3>Manga API</h3>
-  <p>Examples:</p>
-  <ul>
-    <li>/api/manga/Death_is_the_only_ending_for_a_villainess</li>
-    <li>/api/reader?slug=Death_is_the_only_ending_for_a_villainess&chapter=1.34</li>
-    <li>/api/genre/action?page=1&pages=3</li>
-    <li>/api/popular</li>
-    <li>/api/recommendations?count=5&pool_pages=3</li>
-  </ul></body></html>`);
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
+/* serve reader page at /reader */
+app.get('/reader', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'reader.html'));
+});
+app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 /* Start server */
 const PORT = process.env.PORT || 3000;
