@@ -1,77 +1,90 @@
-// app.js — single-file prototype with modular endpoints:
-// /api/home?page=N
-// /api/manga/:slug
-// /api/reader/:slug/:chapter
-//
+// app.js — single-file, no server-side cache, with genre endpoint and robust page-count detection
 // deps: express, axios, cheerio, node-cron, murmurhash3js
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const cron = require('node-cron');
-const murmur = require('murmurhash3js');
-const fs = require('fs');
+const murmur = require('murmurhash3js'); // used only for optional hashing (not for caching here)
 const path = require('path');
 
 const SITE_BASE = 'https://manhwa-tower.ir';
-const DATA_DIR = path.join(__dirname, 'data');
-const DATA_FILE = path.join(DATA_DIR, 'db.json');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify({
-  homeCache: {},   // { pageNumber: [ {slug,title,cover,link} ] }
-  mangas: {},      // { slug: { title, description, genres, cover, chapters:[{chapterNum,title,link}] } }
-  readers: {},     // { slug: { chapterNum: { pages: [...] , fetchedAt: ts } } }
-  lastHomeHash: ''
-}, null, 2), 'utf8');
-
-function readDB(){ return JSON.parse(fs.readFileSync(DATA_FILE,'utf8')); }
-function writeDB(db){ fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2), 'utf8'); }
+const CDN_SAMPLE_HOST = 'cdn.megaman-server.ir'; // sample CDN observed; used for fallback pattern detection
+const MAX_PAGE_CHECK = 2000; // safety cap for page discovery
 
 const app = express();
 app.use(express.json());
 
 /* -------------------------
-   Basic HTML fetcher
+   Basic HTML fetcher (server-side)
    ------------------------- */
-async function fetchHtml(url){
+async function fetchHtml(url, timeout = 20000) {
   const res = await axios.get(url, {
     headers: { 'User-Agent': 'manga-prototype-bot/1.0 (+https://example)' },
-    timeout: 20000
+    timeout
   });
   return res.data;
 }
 
 /* -------------------------
-   Extractors (site-specific selectors)
+   HEAD checker for page existence
+   returns true if resource exists (status 200)
+   allow 200..299 as success
+   ------------------------- */
+async function existsUrl(url, timeout = 8000) {
+  try {
+    const res = await axios({
+      method: 'head',
+      url,
+      timeout,
+      maxRedirects: 3,
+      validateStatus: () => true
+    });
+    return res.status >= 200 && res.status < 300;
+  } catch (e) {
+    // some servers reject HEAD; try lightweight GET with Range header
+    try {
+      const res2 = await axios({
+        method: 'get',
+        url,
+        headers: { Range: 'bytes=0-32' },
+        timeout,
+        maxRedirects: 3,
+        validateStatus: () => true
+      });
+      return res2.status >= 200 && res2.status < 300;
+    } catch (e2) {
+      return false;
+    }
+  }
+}
+
+/* -------------------------
+   Extractors (site-specific selectors you provided)
+   All extractors are live (no server cache).
    ------------------------- */
 
-/** extractHome: returns list of {slug, title, cover, link} from page N */
-async function extractHomePage(page = 1){
+/** extractHomePage(page): list of {slug,title,cover,link} */
+async function extractHomePage(page = 1) {
   const url = page == 1 ? `${SITE_BASE}/page/1` : `${SITE_BASE}/page/${page}`;
   const html = await fetchHtml(url);
   const $ = cheerio.load(html);
   const items = [];
 
-  // primary: .manhwa-card -> a (title/link), maybe img
   $('.manhwa-card').each((i, el) => {
     const a = $(el).find('a').first();
     const link = a.attr('href') ? new URL(a.attr('href'), SITE_BASE).href : null;
     const title = a.attr('title') || a.text().trim() || $(el).find('.card-title').text().trim();
-    // cover image if present
     let cover = $(el).find('img').attr('src') || $(el).find('.cover img').attr('src') || null;
     if (cover) cover = cover.startsWith('http') ? cover : new URL(cover, SITE_BASE).href;
-    // slug inference
     let slug = null;
-    try {
-      if (link) {
-        const parts = new URL(link).pathname.split('/').filter(Boolean);
-        const idx = parts.findIndex(s => s.toLowerCase() === 'manhwa');
-        slug = (idx>=0 && parts.length>idx+1) ? parts[idx+1] : parts[parts.length-1];
-      }
-    } catch(e){}
+    if (link) {
+      const parts = new URL(link).pathname.split('/').filter(Boolean);
+      const idx = parts.findIndex(s => s.toLowerCase() === 'manhwa');
+      slug = (idx >= 0 && parts.length > idx + 1) ? parts[idx + 1] : parts[parts.length - 1];
+    }
     if (link && title) items.push({ slug, title, cover, link });
   });
 
-  // fallback: links containing /Manhwa/
+  // fallback: links containing /Manhwa/ if nothing found
   if (!items.length) {
     $('a[href*="/Manhwa/"]').each((i, el) => {
       const a = $(el);
@@ -81,7 +94,7 @@ async function extractHomePage(page = 1){
         const absolute = new URL(href, SITE_BASE).href;
         const parts = new URL(absolute).pathname.split('/').filter(Boolean);
         const idx = parts.findIndex(s => s.toLowerCase() === 'manhwa');
-        const slug = (idx>=0 && parts.length>idx+1) ? parts[idx+1] : parts[parts.length-1];
+        const slug = (idx >= 0 && parts.length > idx + 1) ? parts[idx + 1] : parts[parts.length - 1];
         const cover = a.find('img').attr('src') || null;
         items.push({ slug, title, cover: cover ? (cover.startsWith('http') ? cover : new URL(cover, SITE_BASE).href) : null, link: absolute });
       }
@@ -91,8 +104,8 @@ async function extractHomePage(page = 1){
   return items;
 }
 
-/** extractGenres: simple list from gener.php */
-async function extractGenres(){
+/** extractGenres(): returns array of {name, slug, link} */
+async function extractGenres() {
   const url = `${SITE_BASE}/gener.php`;
   const html = await fetchHtml(url);
   const $ = cheerio.load(html);
@@ -105,14 +118,15 @@ async function extractGenres(){
         const slug = u.searchParams.get('slug');
         const name = $(el).text().trim();
         if (slug) genres.push({ name, slug, link: u.href });
-      } catch(e){}
+      } catch (e) {}
     }
   });
-  return genres;
+  // dedupe
+  return Array.from(new Map(genres.map(g => [g.slug, g])).values());
 }
 
-/** extractMangaDetail: return metadata + chapters (no images) */
-async function extractMangaDetail(slug){
+/** extractMangaDetail(slug): live fetch of manga page -> metadata + chapters (no images) */
+async function extractMangaDetail(slug) {
   const url = `${SITE_BASE}/Manhwa/${slug}/`;
   const html = await fetchHtml(url);
   const $ = cheerio.load(html);
@@ -122,12 +136,8 @@ async function extractMangaDetail(slug){
                 $('h1').first().text().trim() ||
                 $('title').text().trim();
 
-  // description: find a summary container common names
   let description = $('.kholase, .lead, .description, .post-content').first().text().trim() || '';
-  if (!description) {
-    // try meta description
-    description = $('meta[name="description"]').attr('content') || '';
-  }
+  if (!description) description = $('meta[name="description"]').attr('content') || '';
 
   const genres = [];
   $('.genre-tag, .genre-badge, a[href*="gener.php"]').each((i, el) => {
@@ -135,7 +145,7 @@ async function extractMangaDetail(slug){
     if (t) genres.push(t);
   });
 
-  // find internal id from reader links on page (the B in Chapter=A,B)
+  // internal id (the B in readerpage.php?Chapter=A,B)
   let internalId = null;
   $('a').each((i, el) => {
     const href = $(el).attr('href') || '';
@@ -145,7 +155,7 @@ async function extractMangaDetail(slug){
     }
   });
 
-  // chapters: .chapter-item a
+  // chapters
   const chapters = [];
   $('.chapter-item a, .chapter-list a, .chapters a, a').each((i, el) => {
     const href = $(el).attr('href') || '';
@@ -153,49 +163,48 @@ async function extractMangaDetail(slug){
       const text = $(el).text().trim();
       const match = href.match(/Chapter=(\d+),([^&'"]+)/);
       let chapterNum = null;
-      if (match) chapterNum = parseInt(match[1],10);
+      if (match) chapterNum = parseInt(match[1], 10);
       const absolute = new URL(href, SITE_BASE).href;
       chapters.push({ chapterNum, title: text || (chapterNum ? `Chapter ${chapterNum}` : `#${i+1}`), link: absolute });
     }
   });
 
-  // dedupe+sort desc by chapterNum
+  // dedupe and sort desc
   const uniq = {};
   chapters.forEach(c => { if (c.link) uniq[c.link] = c; });
-  const list = Object.values(uniq).sort((a,b)=> (b.chapterNum||0)-(a.chapterNum||0));
+  const list = Object.values(uniq).sort((a, b) => (b.chapterNum || 0) - (a.chapterNum || 0));
 
-  // try to find a cover image
+  // cover try
   let cover = $('.cover img, .card-img-top, img').first().attr('src') || null;
   if (cover) cover = cover.startsWith('http') ? cover : new URL(cover, SITE_BASE).href;
 
-  return { slug, title, description, genres, internalId, cover, chapters: list, url };
+  return { slug, title, description, genres, internalId, cover, chapters, url };
 }
 
 /* -------------------------
-   Reader: extract page image URLs
+   Reader extraction + accurate page count discovery
    ------------------------- */
-async function extractReaderPages(readerUrl){
+
+/** extractReaderPages(readerUrl): attempts to extract explicit image URLs from reader page (static) */
+async function extractReaderPages(readerUrl) {
   const html = await fetchHtml(readerUrl);
   const $ = cheerio.load(html);
-
   const imgs = [];
-  // 1) try .manhwa-image
+
   $('img.manhwa-image').each((i, el) => {
     const src = $(el).attr('src') || $(el).attr('data-src');
     if (src) imgs.push(src.startsWith('http') ? src : new URL(src, SITE_BASE).href);
   });
 
-  // 2) try reader container
   if (!imgs.length) {
-    $('.mhreader, .mhreader-overlay, .reader, .reader-content').find('img').each((i,el) => {
+    $('.mhreader, .mhreader-overlay, .reader, .reader-content').find('img').each((i, el) => {
       const src = $(el).attr('src') || $(el).attr('data-src');
       if (src) imgs.push(src.startsWith('http') ? src : new URL(src, SITE_BASE).href);
     });
   }
 
-  // 3) any img that looks like cdn or webp/jpg/png
   if (!imgs.length) {
-    $('img').each((i,el) => {
+    $('img').each((i, el) => {
       const src = $(el).attr('src') || $(el).attr('data-src');
       if (src && (src.includes('cdn.') || src.includes('/users/') || src.endsWith('.webp') || src.endsWith('.jpg') || src.endsWith('.png'))) {
         imgs.push(src.startsWith('http') ? src : new URL(src, SITE_BASE).href);
@@ -203,198 +212,204 @@ async function extractReaderPages(readerUrl){
     });
   }
 
-  // 4) sniff scripts for arrays or cdn urls
+  // sniff scripts for arrays or cdn urls
   if (!imgs.length) {
-    const scripts = $('script').map((i,s) => $(s).html()).get().join('\n');
-    // array pattern
+    const scripts = $('script').map((i, s) => $(s).html()).get().join('\n');
     const arrMatch = scripts.match(/\[\"(https?:\/\/[^"]+?\.(?:jpg|png|webp))\"(?:,\s*\"https?:\/\/[^"]+?\.(?:jpg|png|webp)\")+\]/);
     if (arrMatch) {
       try {
-        const jsonArr = JSON.parse(arrMatch[0].replace(/\s/g,''));
+        const jsonArr = JSON.parse(arrMatch[0].replace(/\s/g, ''));
         if (Array.isArray(jsonArr)) imgs.push(...jsonArr);
-      } catch(e){}
+      } catch (e) {}
     }
-    // any urls
     const urlMatches = [...(scripts.matchAll(/https?:\/\/[^'"\s]+(?:webp|jpg|png)/g))].map(m => m[0]);
     if (urlMatches.length) imgs.push(...urlMatches);
   }
 
-  // normalize unique
-  const uniq = Array.from(new Set(imgs.map(u => u && (u.startsWith('http') ? u : new URL(u, SITE_BASE).href)).filter(Boolean)));
-  return uniq;
+  return Array.from(new Set(imgs.map(u => u && (u.startsWith('http') ? u : new URL(u, SITE_BASE).href)).filter(Boolean)));
 }
-
-/* -------------------------
-   CDN fallback (pattern)
-   sample: https://cdn.megaman-server.ir/users/{uid}/{MANGA_NAME}/{CHAPTER}/HD/{PAGE}.webp
-   use only when explicit pages not available
-   ------------------------- */
-function buildFallbackPageUrls({ uid, mangaName, chapter, pageCount = 30 }){
-  const safe = encodeURIComponent(String(mangaName||'').replace(/\s+/g,'_'));
-  const base = `https://cdn.megaman-server.ir/users/${uid || '564'}/${safe}/${chapter}/HD`;
-  const arr = [];
-  for (let i=1;i<=pageCount;i++) arr.push(`${base}/${i}.webp`);
-  return arr;
-}
-
-/* -------------------------
-   API endpoints
-   ------------------------- */
 
 /**
- * Home: paginated list
- * returns JSON array of { slug, title, cover, link }
+ * buildFallbackPageUrl: construct single page URL from observed pattern
+ * pattern assumed: https://cdn.megaman-server.ir/users/{uid}/{MANGA_NAME}/{CHAPTER}/HD/{PAGE}.webp
+ * if UID unknown, user internalId might map to UID; function takes uid param.
  */
-app.get('/api/home', async (req,res)=>{
-  try{
-    const page = parseInt(req.query.page||'1',10) || 1;
-    const db = readDB();
-    // if cached, return
-    if (db.homeCache && db.homeCache[page]) return res.json({ ok:true, page, items: db.homeCache[page] });
+function buildFallbackPageUrl({ uid = '564', mangaName = '', chapter = '', page = 1 }) {
+  const safe = encodeURIComponent(String(mangaName || '').replace(/\s+/g, '_'));
+  return `https://${CDN_SAMPLE_HOST}/users/${uid}/${safe}/${chapter}/HD/${page}.webp`;
+}
 
-    // else extract and cache
-    const items = await extractWithTimeout(()=>extractHomePage(page), 20000);
-    db.homeCache = db.homeCache || {};
-    db.homeCache[page] = items;
-    writeDB(db);
-    res.json({ ok:true, page, items });
-  }catch(e){ res.status(500).json({ ok:false, error: e.message }); }
+/**
+ * discoverPageCountByHead: using exponential + binary search to find last existing page
+ * returns exact page count (<= MAX_PAGE_CHECK) or null on failure
+ */
+async function discoverPageCountByHead({ uid, mangaName, chapter }) {
+  const maxCap = MAX_PAGE_CHECK;
+  // quick check first page
+  const url1 = buildFallbackPageUrl({ uid, mangaName, chapter, page: 1 });
+  if (!await existsUrl(url1)) return null;
+
+  // exponential growth to find upper bound
+  let low = 1, high = 1;
+  while (high < maxCap) {
+    const u = buildFallbackPageUrl({ uid, mangaName, chapter, page: high });
+    const ok = await existsUrl(u);
+    if (!ok) break;
+    low = high;
+    high = high * 2;
+    if (high > maxCap) { high = maxCap; break; }
+  }
+
+  // if high still exists, maybe high==maxCap and exists => return maxCap
+  const highUrl = buildFallbackPageUrl({ uid, mangaName, chapter, page: high });
+  if (await existsUrl(highUrl)) return high; // hit cap
+
+  // binary search between low (exists) and high (not exists)
+  let left = low, right = high; // left exists, right does not
+  while (left + 1 < right) {
+    const mid = Math.floor((left + right) / 2);
+    const midUrl = buildFallbackPageUrl({ uid, mangaName, chapter, page: mid });
+    if (await existsUrl(midUrl)) left = mid;
+    else right = mid;
+  }
+  return left;
+}
+
+/* -------------------------
+   API endpoints (live)
+   ------------------------- */
+
+/** GET /api/home?page=N */
+app.get('/api/home', async (req, res) => {
+  try {
+    const page = parseInt(req.query.page || '1', 10) || 1;
+    const items = await extractHomePage(page);
+    return res.json({ ok: true, page, items });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
-/**
- * Manga detail: returns metadata + chapters (no images)
- */
-app.get('/api/manga/:slug', async (req,res)=>{
-  try{
+/** GET /api/genres */
+app.get('/api/genres', async (req, res) => {
+  try {
+    const list = await extractGenres();
+    return res.json({ ok: true, genres: list });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/** GET /api/genre/:slug?page=N */
+app.get('/api/genre/:slug', async (req, res) => {
+  try {
     const slug = req.params.slug;
-    const db = readDB();
-    // if cached and has chapters, return
-    if (db.mangas && db.mangas[slug] && db.mangas[slug].chapters && db.mangas[slug].chapters.length) {
-      return res.json({ ok:true, manga: db.mangas[slug] });
-    }
-    // else extract and store
-    const detail = await extractWithTimeout(()=>extractMangaDetail(slug), 20000);
-    db.mangas = db.mangas || {};
-    db.mangas[slug] = { ...(db.mangas[slug]||{}), ...detail, fetchedAt: Date.now() };
-    writeDB(db);
-    res.json({ ok:true, manga: db.mangas[slug] });
-  }catch(e){ res.status(500).json({ ok:false, error: e.message }); }
+    const page = parseInt(req.query.page || '1', 10) || 1;
+    // try URL pattern: gener.php?slug={slug}&page={page} or gener.php?slug={slug} (some sites use query param page)
+    const url = `${SITE_BASE}/gener.php?slug=${encodeURIComponent(slug)}${page > 1 ? '&page=' + page : ''}`;
+    const html = await fetchHtml(url);
+    const $ = cheerio.load(html);
+    const items = [];
+    $('.manhwa-card').each((i, el) => {
+      const a = $(el).find('a').first();
+      const link = a.attr('href') ? new URL(a.attr('href'), SITE_BASE).href : null;
+      const title = a.attr('title') || a.text().trim() || $(el).find('.card-title').text().trim();
+      let cover = $(el).find('img').attr('src') || null;
+      if (cover) cover = cover.startsWith('http') ? cover : new URL(cover, SITE_BASE).href;
+      let slugInfer = null;
+      if (link) {
+        const parts = new URL(link).pathname.split('/').filter(Boolean);
+        const idx = parts.findIndex(s => s.toLowerCase() === 'manhwa');
+        slugInfer = (idx >= 0 && parts.length > idx + 1) ? parts[idx + 1] : parts[parts.length - 1];
+      }
+      if (link && title) items.push({ slug: slugInfer, title, cover, link });
+    });
+    return res.json({ ok: true, genre: slug, page, items });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/** GET /api/manga/:slug  -> metadata + chapters (no images) */
+app.get('/api/manga/:slug', async (req, res) => {
+  try {
+    const slug = req.params.slug;
+    const detail = await extractMangaDetail(slug);
+    return res.json({ ok: true, manga: detail });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 /**
- * Reader: returns pages[] for given slug+chapter
- * Steps:
- * 1) try to find reader link from stored manga chapters and fetch explicit images
- * 2) if not found or images empty, but internalId exists -> construct fallback pattern
- * 3) else 422 with guidance
+ * GET /api/reader/:slug/:chapter
+ * returns pages[] and exact pageCount if possible, plus method info
  */
-app.get('/api/reader/:slug/:chapter', async (req,res)=>{
-  try{
+app.get('/api/reader/:slug/:chapter', async (req, res) => {
+  try {
     const slug = req.params.slug;
     const chapter = req.params.chapter;
-    const db = readDB();
-    const manga = db.mangas && db.mangas[slug];
 
-    if (!manga) return res.status(404).json({ ok:false, error:'manga not cached; call /api/manga/:slug first' });
-
-    // try to find chapter link
+    // 1) get manga detail live to obtain chapters/internalId if needed
+    const manga = await extractMangaDetail(slug);
+    // try to find reader link for this chapter
     let chapterLink = null;
     if (manga.chapters && manga.chapters.length) {
       const found = manga.chapters.find(c => String(c.chapterNum) === String(chapter) || (c.title && c.title.includes(String(chapter))));
       if (found) chapterLink = found.link;
     }
 
-    // if we have cached reader pages, return
-    db.readers = db.readers || {};
-    db.readers[slug] = db.readers[slug] || {};
-    if (db.readers[slug][chapter] && db.readers[slug][chapter].pages && db.readers[slug][chapter].pages.length) {
-      return res.json({ ok:true, method:'cache', pages: db.readers[slug][chapter].pages });
-    }
-
-    // 1) if chapterLink present, try to parse explicit pages
+    // 2) try explicit extraction from reader link
     if (chapterLink) {
-      const pages = await extractWithTimeout(()=>extractReaderPages(chapterLink), 20000).catch(()=>[]);
+      const pages = await extractReaderPages(chapterLink);
       if (pages && pages.length) {
-        db.readers[slug][chapter] = { pages, fetchedAt: Date.now(), method:'explicit' };
-        writeDB(db);
-        return res.json({ ok:true, method:'explicit', pages });
+        return res.json({ ok: true, method: 'explicit', pages, pageCount: pages.length });
       }
     }
 
-    // 2) try fallback using internalId stored in manga.internalId
-    const uid = manga.internalId || manga.internalId || null;
+    // 3) fallback: try to use internalId -> map to uid (we assume internalId correlates with uid)
+    const uid = manga.internalId || null;
+    const mangaName = manga.title || slug;
     if (uid) {
-      // try small pageCount fallback to avoid huge guesses; app can request more pages if exists
-      const pageCountGuess = 25;
-      const pages = buildFallbackPageUrls({ uid, mangaName: manga.title || slug, chapter, pageCount: pageCountGuess });
-      db.readers[slug][chapter] = { pages, fetchedAt: Date.now(), method:'fallback', note:'guessed pageCount' };
-      writeDB(db);
-      return res.json({ ok:true, method:'fallback', pages });
+      // discover page count precisely using HEAD checks
+      const pageCount = await discoverPageCountByHead({ uid, mangaName, chapter }).catch(()=>null);
+      if (pageCount && pageCount > 0) {
+        // build exact pages list
+        const pages = [];
+        for (let i = 1; i <= pageCount; i++) {
+          pages.push(buildFallbackPageUrl({ uid, mangaName, chapter, page: i }));
+        }
+        return res.json({ ok: true, method: 'fallback-discovered', pages, pageCount });
+      } else {
+        // if discovery failed, still return a small guessed set as fallback with note
+        const guessed = [];
+        const guessCount = 25;
+        for (let i = 1; i <= guessCount; i++) guessed.push(buildFallbackPageUrl({ uid, mangaName, chapter, page: i }));
+        return res.json({ ok: true, method: 'fallback-guess', pages: guessed, note: 'exact pageCount could not be discovered; returned guessed first pages; consider enabling Playwright extractor if site builds reader via heavy JS.' });
+      }
     }
 
-    // 3) last resort: cannot extract
-    return res.status(422).json({ ok:false, error:'Could not obtain pages. Ensure /api/manga/:slug was called and that chapters/internalId exist. If reader requires JS to build pages, consider Playwright-based extractor.' });
+    // 4) last resort: cannot produce pages
+    return res.status(422).json({ ok: false, error: 'Could not extract pages. Ensure the manga slug is correct and the site does not rely on heavy JS to render reader. If so, use a Playwright-based extractor.' });
 
-  }catch(e){ res.status(500).json({ ok:false, error: e.message }); }
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
-/* health */
-app.get('/api/health', (req,res)=> res.json({ ok:true, ts: Date.now() }) );
+/* basic health */
+app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
-/* simple front page for manual testing */
-app.get('/', (req,res)=>{
-  res.type('html').send(`
-  <html><head><meta charset="utf-8"><title>Manga API</title></head><body style="font-family:Arial, sans-serif;max-width:900px;margin:20px auto">
-  <h2>Manga Prototype API</h2>
-  <p>Endpoints: <code>/api/home?page=N</code> • <code>/api/manga/:slug</code> • <code>/api/reader/:slug/:chapter</code></p>
-  <div><button onclick="loadHome()">load home (page1)</button></div>
-  <pre id="out"></pre>
-  <script>
-    async function api(p){ const r = await fetch(p); return r.json(); }
-    async function loadHome(){
-      const d = await api('/api/home?page=1');
-      document.getElementById('out').innerText = JSON.stringify(d, null, 2);
-    }
-  </script>
-  </body></html>
-  `);
+/* a tiny front page for manual quick test */
+app.get('/', (req, res) => {
+  res.type('html').send(`<html><body style="font-family:Arial">
+    <h3>Manga API (live extraction, no server cache)</h3>
+    <p>/api/home?page=1 • /api/genres • /api/genre/:slug?page=N • /api/manga/:slug • /api/reader/:slug/:chapter</p>
+    </body></html>`);
 });
 
 /* -------------------------
-   Cron: poll /page/1 every 15 minutes to detect updates
+   Start
    ------------------------- */
-cron.schedule('*/15 * * * *', async ()=>{
-  try{
-    console.log('[cron] poll page/1');
-    const items = await extractWithTimeout(()=>extractHomePage(1), 20000).catch(()=>[]);
-    const db = readDB();
-    const hash = murmur.x86.hash128(JSON.stringify(items.map(i=>i.link)));
-    if (db.lastHomeHash !== hash) {
-      console.log('[cron] home changed — update cache and db snapshot');
-      db.lastHomeHash = hash;
-      db.homeCache = db.homeCache || {};
-      db.homeCache[1] = items;
-      // upsert titles/slugs into mangas minimal record
-      db.mangas = db.mangas || {};
-      items.forEach(it => {
-        if (it.slug) db.mangas[it.slug] = { ...(db.mangas[it.slug]||{}), slug: it.slug, title: it.title, cover: it.cover, listLink: it.link, updatedAt: Date.now() };
-      });
-      writeDB(db);
-    } else {
-      console.log('[cron] no change');
-    }
-  }catch(e){ console.error('[cron] error', e.message); }
-});
-
-/* timeout wrapper for extractors */
-function extractWithTimeout(fn, ms=15000){
-  return new Promise((resolve, reject)=>{
-    let done = false;
-    fn().then(r=>{ if(!done){ done=true; resolve(r); } }).catch(e=>{ if(!done){ done=true; reject(e); } });
-    setTimeout(()=>{ if(!done){ done=true; reject(new Error('extractor timeout')); } }, ms);
-  });
-}
-
-/* start */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, ()=> console.log(`Server running http://localhost:${PORT} — endpoints: /api/home /api/manga/:slug /api/reader/:slug/:chapter`));
+app.listen(PORT, () => console.log(`Server running http://localhost:${PORT} — live extraction mode (no server cache).`));
