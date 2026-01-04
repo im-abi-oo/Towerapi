@@ -1,4 +1,4 @@
-// server.js — stable, no API token, fixed structure, supports decimal chapters and genre pagination
+// server.js — full updated version
 // Deps: express, axios, cheerio
 // npm i express axios cheerio
 
@@ -11,7 +11,7 @@ const CDN_SAMPLE_HOST = 'cdn.megaman-server.ir';
 const MAX_PAGE_CHECK = 2000;
 
 const app = express();
-app.use(express.json({ limit: '200kb' })); // small protection for huge bodies
+app.use(express.json({ limit: '200kb' }));
 
 /* -------------------------
    Utilities
@@ -67,79 +67,126 @@ async function existsUrl(url, timeout = 8000) {
 }
 
 /* -------------------------
-   Extractors
+   Extractors (improved)
    ------------------------- */
-async function extractHomePage(page = 1) {
-  const url = page === 1 ? `${SITE_BASE}/page/1` : `${SITE_BASE}/page/${page}`;
-  const html = await fetchHtml(url);
-  const $ = cheerio.load(html);
-  const items = [];
 
+/* --- 1) extractHomePage: try several pagination patterns, robust dedupe --- */
+async function extractHomePage(page = 1) {
+  const candidates = [
+    `${SITE_BASE}/page/${page}`,
+    `${SITE_BASE}/page/${page}/`,
+    `${SITE_BASE}/?paged=${page}`,
+    `${SITE_BASE}/?page=${page}`,
+    `${SITE_BASE}/page/${page}?ajax=1`
+  ];
+
+  let html = null;
+  let usedUrl = null;
+  for (const u of candidates) {
+    try {
+      html = await fetchHtml(u);
+      if (html && (html.includes('manhwa-card') || html.match(/\/Manhwa\/[A-Za-z0-9\-_]+/i) || html.includes('gener.php'))) {
+        usedUrl = u;
+        break;
+      }
+    } catch (e) {
+      logErr(e, `extractHomePage candidate ${u}`);
+    }
+  }
+  if (!html) throw new Error('Could not fetch home page HTML for any pagination pattern.');
+
+  const $ = cheerio.load(html);
+  const map = new Map();
+
+  // Primary selector
   $('.manhwa-card').each((i, el) => {
     const a = $(el).find('a').first();
     const href = a.attr('href') || '';
     const link = href ? new URL(href, SITE_BASE).href : null;
-    const title = a.attr('title') || a.text().trim() || $(el).find('.card-title').text().trim();
-    let cover = $(el).find('img').attr('src') || $(el).find('.cover img').attr('src') || null;
+    const img = $(el).find('img').first();
+    const title = a.attr('title') || (img && img.attr('alt')) || a.text().trim() || $(el).find('.card-title').text().trim();
+    let cover = img && (img.attr('src') || img.attr('data-src')) || null;
     if (cover && !cover.startsWith('http')) cover = new URL(cover, SITE_BASE).href;
-    let slug = null;
-    if (link) {
-      try {
-        const parts = new URL(link).pathname.split('/').filter(Boolean);
-        const idx = parts.findIndex(s => s.toLowerCase() === 'manhwa');
-        slug = (idx >= 0 && parts.length > idx + 1) ? parts[idx + 1] : parts[parts.length - 1];
-      } catch (e) {}
-    }
-    if (link && title) items.push({ slug, title, cover, link });
+    if (link && title) map.set(link, { link, title, cover });
   });
 
-  if (!items.length) {
-    $('a[href*="/Manhwa/"]').each((i, el) => {
-      const a = $(el);
-      const href = a.attr('href');
-      const title = a.attr('title') || a.text().trim();
-      if (href && title) {
-        const absolute = new URL(href, SITE_BASE).href;
-        const parts = new URL(absolute).pathname.split('/').filter(Boolean);
-        const idx = parts.findIndex(s => s.toLowerCase() === 'manhwa');
-        const slug = (idx >= 0 && parts.length > idx + 1) ? parts[idx + 1] : parts[parts.length - 1];
-        const cover = a.find('img').attr('src') || null;
-        const coverAbs = cover ? (cover.startsWith('http') ? cover : new URL(cover, SITE_BASE).href) : null;
-        items.push({ slug, title, cover: coverAbs, link: absolute });
-      }
-    });
-  }
+  // Fallback: anchors linking to /Manhwa/, /manhwa/, /manga/
+  $('a[href]').each((i, el) => {
+    const a = $(el);
+    const href = a.attr('href') || '';
+    if (!href.match(/\/(Manhwa|manhwa|manga)\/[A-Za-z0-9\-_]+/i)) return;
+    try {
+      const link = new URL(href, SITE_BASE).href;
+      if (map.has(link)) return;
+      const img = a.find('img').first();
+      const title = a.attr('title') || (img && img.attr('alt')) || a.text().trim();
+      let cover = img && (img.attr('src') || img.attr('data-src')) || null;
+      if (cover && !cover.startsWith('http')) cover = new URL(cover, SITE_BASE).href;
+      if (link && title) map.set(link, { link, title, cover });
+    } catch (e) {}
+  });
 
+  // Another fallback: article/card blocks
+  $('article, .post, .card').each((i, el) => {
+    const a = $(el).find('a[href*="/Manhwa/"], a[href*="/manhwa/"], a[href*="/manga/"]').first();
+    if (!a || !a.attr) return;
+    const href = a.attr('href') || '';
+    try {
+      const link = new URL(href, SITE_BASE).href;
+      if (map.has(link)) return;
+      const img = $(el).find('img').first();
+      const title = a.attr('title') || (img && img.attr('alt')) || $(el).find('h2, h3').first().text().trim();
+      let cover = img && (img.attr('src') || img.attr('data-src')) || null;
+      if (cover && !cover.startsWith('http')) cover = new URL(cover, SITE_BASE).href;
+      if (link && title) map.set(link, { link, title, cover });
+    } catch (e) {}
+  });
+
+  const items = Array.from(map.values());
   return items;
 }
 
-/* Genres: page extractor for a single gener.php page */
+/* --- 2) extractGenresPage: robust genre link detection --- */
 async function extractGenresPage(pageUrl = `${SITE_BASE}/gener.php`) {
   const html = await fetchHtml(pageUrl);
   const $ = cheerio.load(html);
   const genres = [];
-  const anchors = $('a.genre-btn, a[href*="slug="], a[href*="gener.php"]');
-  anchors.each((i, el) => {
+
+  // Generic anchors that look like genre links
+  $('a').each((i, el) => {
     const href = $(el).attr('href') || '';
-    const name = $(el).text().trim();
-    if (!href || !name) return;
+    const text = $(el).text().trim();
+    if (!href || !text) return;
+    if (href.includes('slug=') || href.includes('gener.php') || /\/genre\//i.test(href) || /\/gener/i.test(href)) {
+      try {
+        const resolved = new URL(href, pageUrl);
+        const slug = resolved.searchParams.get('slug') || (() => {
+          const p = resolved.pathname.split('/').filter(Boolean);
+          return p.length ? p[p.length - 1] : null;
+        })();
+        if (slug) genres.push({ name: text, slug, link: resolved.href });
+      } catch (e) {}
+    }
+  });
+
+  // Lists like ul.genre-list, .tags
+  $('ul, .genre-list, .tags').find('a').each((i, el) => {
+    const href = $(el).attr('href') || '';
+    const text = $(el).text().trim();
+    if (!href || !text) return;
     try {
       const resolved = new URL(href, pageUrl);
-      const slug = resolved.searchParams.get('slug') || (() => {
-        const p = resolved.pathname.split('/').filter(Boolean);
-        return p.length ? p[p.length - 1] : null;
-      })();
-      const link = resolved.href;
-      if (slug) genres.push({ name, slug, link });
+      const slug = resolved.searchParams.get('slug') || resolved.pathname.split('/').filter(Boolean).pop();
+      if (slug) genres.push({ name: text, slug, link: resolved.href });
     } catch (e) {}
   });
-  // dedupe by slug
+
   const map = new Map();
   for (const g of genres) if (g.slug && !map.has(g.slug)) map.set(g.slug, g);
   return Array.from(map.values());
 }
 
-/* aggregate multiple genre pages: we don't impose a hard ceiling here — caller decides pages param */
+/* aggregate multiple genre pages */
 async function extractGenres(totalPages = 1) {
   const p = Math.max(1, Number(totalPages) || 1);
   const urls = [];
@@ -157,7 +204,7 @@ async function extractGenres(totalPages = 1) {
   return Array.from(map.values());
 }
 
-/* Manga detail extractor with decimal chapter support */
+/* --- 3) extractMangaDetail: decimal chapter support, better chapter detection --- */
 async function extractMangaDetail(slug) {
   const safeSlug = sanitizeSlug(slug) || slug;
   const url = `${SITE_BASE}/Manhwa/${safeSlug}/`;
@@ -244,38 +291,79 @@ async function extractMangaDetail(slug) {
   return { slug: safeSlug, title, description, genres, internalId, cover, chapters: list, url };
 }
 
-/* Reader pages extraction with script fallback */
+/* --- 4) extractReaderPages: much stronger extraction (noscript, iframe, script arrays, srcset) --- */
 async function extractReaderPages(readerUrl) {
   const html = await fetchHtml(readerUrl);
   const $ = cheerio.load(html);
   const imgs = [];
 
-  $('img.manhwa-image').each((i, el) => {
-    const src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-lazy-src');
-    if (src) imgs.push(src.startsWith('http') ? src : new URL(src, SITE_BASE).href);
+  // 1) direct reader images by common selectors
+  $('img.manhwa-image, img.reader-img, .reader img, .mhreader img').each((i, el) => {
+    const src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-lazy-src') || $(el).attr('data-srcset') || $(el).attr('srcset');
+    if (!src) return;
+    let chosen = src;
+    if (chosen.includes(',')) chosen = chosen.split(',')[0].trim().split(' ')[0];
+    if (chosen && !chosen.startsWith('http')) chosen = new URL(chosen, readerUrl).href;
+    imgs.push(chosen);
   });
 
+  // 2) noscript blocks
+  $('noscript').each((i, el) => {
+    const inner = $(el).html() || '';
+    const $$ = cheerio.load(inner);
+    $$('img').each((j, im) => {
+      const s = $$(im).attr('src') || $$(im).attr('data-src');
+      if (s) imgs.push(s.startsWith('http') ? s : new URL(s, readerUrl).href);
+    });
+  });
+
+  // 3) iframe: fetch iframe and parse its images
+  const iframeSrc = $('iframe[src]').first().attr('src');
+  if (iframeSrc) {
+    try {
+      const abs = new URL(iframeSrc, readerUrl).href;
+      const iframeHtml = await fetchHtml(abs);
+      const $$ = cheerio.load(iframeHtml);
+      $$('img').each((i, el) => {
+        const s = $$(el).attr('src') || $$(el).attr('data-src');
+        if (s) imgs.push(s.startsWith('http') ? s : new URL(s, abs).href);
+      });
+    } catch (e) { logErr(e, 'iframe fetch in extractReaderPages'); }
+  }
+
+  // 4) script arrays / inline JSON with images
+  const scripts = $('script').map((i, s) => $(s).html()).get().join('\n') || '';
+  const arrMatches = [...scripts.matchAll(/\[\s*["'](https?:\/\/[^"']+\.(?:jpg|jpeg|png|webp))["'](?:\s*,\s*["']https?:\/\/[^"']+\.(?:jpg|jpeg|png|webp)["'])+\s*\]/g)];
+  for (const m of arrMatches) {
+    try {
+      const json = m[0];
+      const parsed = JSON.parse(json);
+      if (Array.isArray(parsed)) parsed.forEach(u => imgs.push(u));
+    } catch (e) {}
+  }
+  // any url-like matches in scripts
+  const urlMatches = [...scripts.matchAll(/https?:\/\/[^'"\s]+?(?:webp|jpg|jpeg|png)/g)].map(m => m[0]);
+  urlMatches.forEach(u => imgs.push(u));
+
+  // 5) final generic <img> fallback
   if (!imgs.length) {
-    $('.mhreader, .reader, .reader-content').find('img').each((i, el) => {
-      const src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-lazy-src') || $(el).attr('srcset');
-      if (src) {
-        let chosen = src;
-        if (chosen.includes(',')) chosen = chosen.split(',')[0].trim().split(' ')[0];
-        imgs.push(chosen.startsWith('http') ? chosen : new URL(chosen, SITE_BASE).href);
-      }
+    $('img').each((i, el) => {
+      const src = $(el).attr('src') || $(el).attr('data-src');
+      if (src) imgs.push(src.startsWith('http') ? src : new URL(src, readerUrl).href);
     });
   }
 
-  if (!imgs.length) {
-    const scripts = $('script').map((i, s) => $(s).html()).get().join('\n');
-    const urlMatches = [...scripts.matchAll(/https?:\/\/[^'"\s]+?(?:webp|jpg|png)/g)].map(m => m[0]);
-    if (urlMatches.length) imgs.push(...urlMatches);
-  }
+  // normalize and dedupe
+  const cleaned = Array.from(new Set(imgs.map(u => {
+    if (!u) return null;
+    const s = String(u).trim();
+    return (s.startsWith('http') ? s : (new URL(s, SITE_BASE).href));
+  }).filter(Boolean)));
 
-  return Array.from(new Set(imgs.map(u => u && (u.startsWith('http') ? u : new URL(u, SITE_BASE).href)).filter(Boolean)));
+  return cleaned;
 }
 
-/* fallback CDN builder and page-count discovery (binary search) */
+/* --- 5) fallback CDN builder + binary search for page count --- */
 function buildFallbackPageUrl({ uid = '564', mangaName = '', chapter = '', page = 1 }) {
   const safe = encodeURIComponent(String(mangaName || '').replace(/\s+/g, '_'));
   return `https://${CDN_SAMPLE_HOST}/users/${uid}/${safe}/${chapter}/HD/${page}.webp`;
@@ -334,7 +422,7 @@ app.get('/api/genres', async (req, res) => {
 
 /*
   GET /api/genre/:slug?page=1&pages=3
-  page = start page, pages = how many consecutive pages to fetch (page=2&pages=3 => 2,3,4)
+  page = start page, pages = how many consecutive pages to fetch
 */
 app.get('/api/genre/:slug', async (req, res) => {
   try {
@@ -349,12 +437,13 @@ app.get('/api/genre/:slug', async (req, res) => {
       const html = await fetchHtml(url);
       const $ = cheerio.load(html);
       const items = [];
+      // try same robust scraping logic as home
       $('.manhwa-card').each((i, el) => {
         const a = $(el).find('a').first();
         const href = a.attr('href') || '';
         const link = href ? new URL(href, SITE_BASE).href : null;
         const title = a.attr('title') || a.text().trim() || $(el).find('.card-title').text().trim();
-        let cover = $(el).find('img').attr('src') || null;
+        let cover = $(el).find('img').attr('src') || $(el).find('img').attr('data-src') || null;
         if (cover && !cover.startsWith('http')) cover = new URL(cover, SITE_BASE).href;
         let slugInfer = null;
         if (link) {
@@ -364,6 +453,23 @@ app.get('/api/genre/:slug', async (req, res) => {
         }
         if (link && title) items.push({ slug: slugInfer, title, cover, link });
       });
+
+      // fallback anchors containing /Manhwa/
+      $('a[href]').each((i, el) => {
+        const a = $(el);
+        const href = a.attr('href') || '';
+        if (!href.match(/\/(Manhwa|manhwa|manga)\/[A-Za-z0-9\-_]+/i)) return;
+        try {
+          const link = new URL(href, SITE_BASE).href;
+          if (items.find(it => it.link === link)) return;
+          const img = a.find('img').first();
+          const title = a.attr('title') || (img && img.attr('alt')) || a.text().trim();
+          let cover = img && (img.attr('src') || img.attr('data-src')) || null;
+          if (cover && !cover.startsWith('http')) cover = new URL(cover, SITE_BASE).href;
+          if (link && title) items.push({ slug: null, title, cover, link });
+        } catch (e) {}
+      });
+
       return items;
     })());
 
@@ -410,7 +516,7 @@ app.get('/api/manga', async (req, res) => {
   }
 });
 
-/* Reader endpoints (both path and query). chapter accepts "1", "1.34", "1_34" */
+/* Reader endpoints (path and query) */
 app.get('/api/reader/:slug/:chapter', async (req, res) => {
   const q = { slug: req.params.slug, chapter: req.params.chapter };
   return handleReaderQuery(q, res);
@@ -482,6 +588,6 @@ app.get('/', (req, res) => {
   </ul></body></html>`);
 });
 
-/* Start */
+/* Start server */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
